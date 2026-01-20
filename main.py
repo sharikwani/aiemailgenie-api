@@ -23,7 +23,7 @@ PlanMode = Literal["free", "pro"]
 # -----------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-app = FastAPI(title="AI Mail Genie AI API", version="3.2.0")
+app = FastAPI(title="AI Mail Genie AI API", version="3.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -343,50 +343,71 @@ def decide_verdict(
 
 
 # -----------------------------
-# License gate (uses Worker)
+# License gate (uses Worker) - UPDATED
 # -----------------------------
 def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
     """
-    Calls Worker /license/validate.
-    If endpoint is not deployed yet, safely falls back to free mode.
+    Calls Worker /license/validate with auto-activation.
+    Safe fallback to free mode on any failure.
+
+    Normalized return:
+      { ok: True, mode: "free"|"pro", reason?: str, plan?: {...}, license_id?: int }
     """
     license_key = (license_key or "").strip()
     device_id = (device_id or "").strip()
 
-    # No license provided => free mode
+    # No license or device => free
     if not license_key or not device_id:
-        return {"ok": True, "mode": "free"}
+        return {"ok": True, "mode": "free", "reason": "missing_license_or_device"}
 
     # If DB API isn't configured, do not break the app; default free
     if not DB_API_URL or not DB_API_KEY:
-        return {"ok": True, "mode": "free"}
+        return {"ok": True, "mode": "free", "reason": "db_not_configured"}
 
     try:
-        data = db_post("/license/validate", {"license_key": license_key, "device_id": device_id}, timeout=12)
-        # Expected: {"ok": True, "mode": "pro"|"free", ...}
-        if isinstance(data, dict) and data.get("ok") is True:
-            return data
-        return {"ok": True, "mode": "free"}
+        data = db_post(
+            "/license/validate",
+            {"license_key": license_key, "device_id": device_id, "auto_activate": True},
+            timeout=12,
+        )
+
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            return {"ok": True, "mode": "free", "reason": "unexpected_response"}
+
+        valid = bool(data.get("valid"))
+        if not valid:
+            return {"ok": True, "mode": "free", "reason": str(data.get("reason") or "invalid")}
+
+        return {
+            "ok": True,
+            "mode": "pro",
+            "license_id": data.get("license_id"),
+            "plan": data.get("plan") or {},
+        }
+
     except HTTPException as e:
-        # If validate isn't implemented yet, Worker will return 404.
-        # We treat that as "free" until the endpoint exists.
-        if e.status_code == 404:
-            return {"ok": True, "mode": "free"}
-        # For other errors (401/500), also fail safe to free for now.
-        return {"ok": True, "mode": "free"}
+        return {"ok": True, "mode": "free", "reason": f"db_error_{e.status_code}"}
     except Exception:
-        return {"ok": True, "mode": "free"}
+        return {"ok": True, "mode": "free", "reason": "db_error_unknown"}
 
 
-def usage_increment_best_effort(license_key: str, amount: int = 1) -> None:
+def usage_increment_best_effort(license_key: str, device_id: str, amount: int = 1) -> None:
     """
     Calls Worker /usage/increment, but never breaks user flow if it fails.
+    Includes device_id to enforce anti-sharing server-side.
     """
     license_key = (license_key or "").strip()
-    if not license_key or not DB_API_URL or not DB_API_KEY:
+    device_id = (device_id or "").strip()
+
+    if not license_key or not device_id or not DB_API_URL or not DB_API_KEY:
         return
+
     try:
-        db_post("/usage/increment", {"license_key": license_key, "amount": int(amount)}, timeout=12)
+        db_post(
+            "/usage/increment",
+            {"license_key": license_key, "device_id": device_id, "amount": int(amount)},
+            timeout=12,
+        )
     except Exception:
         return
 
@@ -421,16 +442,14 @@ class ChatRequest(BaseModel):
     userMessage: Optional[str] = Field(default=None, max_length=2000)
     history: List[ChatMessage] = Field(default_factory=list)
 
-    # monetization / plan gating (client hint for now)
+    # monetization / plan gating (client hint for now; server overrides)
     mode: PlanMode = "free"
     strictness: Literal["normal", "strict_finance", "low_noise"] = "normal"
 
     followupCount: Optional[int] = None
     maxFollowups: int = 5
 
-    # -----------------------------
     # NEW: License system inputs (extension will send these)
-    # -----------------------------
     licenseKey: str = Field(default="", max_length=80)
     deviceId: str = Field(default="", max_length=120)
 
@@ -632,6 +651,7 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "noise": noise,
 
         "plan": {
+            # server will override for gating; kept for context/hints only
             "mode": req.mode,
             "strictness": req.strictness,
         },
@@ -659,7 +679,7 @@ def ai_chat(req: ChatRequest):
     require_openai_api_key()
 
     # -----------------------------
-    # NEW: server-side plan enforcement from license
+    # Server-side plan enforcement from license (UPDATED)
     # -----------------------------
     license_info = license_validate_or_free_fallback(req.licenseKey, req.deviceId)
     mode_from_db = (license_info.get("mode") or "free").lower().strip()
@@ -736,7 +756,9 @@ def ai_chat(req: ChatRequest):
             raise ValueError("Empty reply")
 
         # Best-effort usage tracking (won't break user experience)
-        usage_increment_best_effort(req.licenseKey, amount=1)
+        # Only meter Pro usage; include device_id to prevent key sharing.
+        if mode == "pro":
+            usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
 
         return ChatResponse(reply=reply)
     except Exception as e:
