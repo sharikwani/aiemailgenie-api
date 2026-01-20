@@ -12,18 +12,6 @@ from openai import OpenAI
 
 # =============================================================================
 # AI Mail Genie Server (FastAPI)
-#
-# Design:
-# - Deterministic server-side verdict layer:
-#     SAFE / CAUTION / HIGH RISK with confidence
-# - Model must follow the server verdict exactly (no hedging).
-# - No claims about SPF/DKIM/DMARC/DNS/bank ownership unless explicitly provided.
-# - Privacy: snippet is already redacted client-side; server re-redacts as a backstop.
-#
-# Monetization-ready:
-# - mode = "free" or "pro"
-#   - Free: initial analysis only
-#   - Pro: follow-ups + deep-dive sections
 # =============================================================================
 
 Verdict = Literal["SAFE", "CAUTION", "HIGH RISK"]
@@ -31,11 +19,11 @@ PlanMode = Literal["free", "pro"]
 
 
 # -----------------------------
-# OpenAI / App init (MUST be before @app routes)
+# OpenAI / App init
 # -----------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-app = FastAPI(title="AI Mail Genie AI API", version="3.1.0")
+app = FastAPI(title="AI Mail Genie AI API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +41,7 @@ DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
 DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
 
-def require_api_key():
+def require_openai_api_key():
     k = os.environ.get("OPENAI_API_KEY", "")
     if not k or not k.startswith("sk-"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set or invalid")
@@ -113,7 +101,7 @@ def health():
 
 @app.get("/health/db")
 def health_db():
-    # Checks the Cloudflare Worker + D1 health endpoint
+    # Safe DB diagnostic: does not break /health
     if not DB_API_URL or not DB_API_KEY:
         return {"ok": True, "db": "not_configured"}
 
@@ -121,22 +109,11 @@ def health_db():
         data = db_get("/health/db", timeout=15)
         return {"ok": True, "db": data}
     except HTTPException as e:
-        # keep /health/db non-fatal: return error details without breaking /health
         return {"ok": True, "db": "error", "detail": str(e.detail)[:300]}
 
 
 # -----------------------------
-# TEMP DEBUG ENDPOINT (remove after you confirm env is correct)
-# -----------------------------
-    # Do NOT expose secrets. Only return URL presence.
-    return {
-        "db_api_url": DB_API_URL,
-        "db_api_key_set": bool(DB_API_KEY),
-    }
-
-
-# -----------------------------
-# Helpers
+# Helpers (privacy, parsing)
 # -----------------------------
 def safe_clean_domain(d: str) -> str:
     d = (d or "").strip().lower()
@@ -366,6 +343,55 @@ def decide_verdict(
 
 
 # -----------------------------
+# License gate (uses Worker)
+# -----------------------------
+def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
+    """
+    Calls Worker /license/validate.
+    If endpoint is not deployed yet, safely falls back to free mode.
+    """
+    license_key = (license_key or "").strip()
+    device_id = (device_id or "").strip()
+
+    # No license provided => free mode
+    if not license_key or not device_id:
+        return {"ok": True, "mode": "free"}
+
+    # If DB API isn't configured, do not break the app; default free
+    if not DB_API_URL or not DB_API_KEY:
+        return {"ok": True, "mode": "free"}
+
+    try:
+        data = db_post("/license/validate", {"license_key": license_key, "device_id": device_id}, timeout=12)
+        # Expected: {"ok": True, "mode": "pro"|"free", ...}
+        if isinstance(data, dict) and data.get("ok") is True:
+            return data
+        return {"ok": True, "mode": "free"}
+    except HTTPException as e:
+        # If validate isn't implemented yet, Worker will return 404.
+        # We treat that as "free" until the endpoint exists.
+        if e.status_code == 404:
+            return {"ok": True, "mode": "free"}
+        # For other errors (401/500), also fail safe to free for now.
+        return {"ok": True, "mode": "free"}
+    except Exception:
+        return {"ok": True, "mode": "free"}
+
+
+def usage_increment_best_effort(license_key: str, amount: int = 1) -> None:
+    """
+    Calls Worker /usage/increment, but never breaks user flow if it fails.
+    """
+    license_key = (license_key or "").strip()
+    if not license_key or not DB_API_URL or not DB_API_KEY:
+        return
+    try:
+        db_post("/usage/increment", {"license_key": license_key, "amount": int(amount)}, timeout=12)
+    except Exception:
+        return
+
+
+# -----------------------------
 # API models
 # -----------------------------
 class ChatMessage(BaseModel):
@@ -401,6 +427,12 @@ class ChatRequest(BaseModel):
 
     followupCount: Optional[int] = None
     maxFollowups: int = 5
+
+    # -----------------------------
+    # NEW: License system inputs (extension will send these)
+    # -----------------------------
+    licenseKey: str = Field(default="", max_length=80)
+    deviceId: str = Field(default="", max_length=120)
 
 
 class ChatResponse(BaseModel):
@@ -556,7 +588,7 @@ def sanitize_history_for_followups(history: List["ChatMessage"]) -> List["ChatMe
     return trimmed
 
 
-def build_context(req: ChatRequest) -> Dict[str, Any]:
+def build_context(req: "ChatRequest") -> Dict[str, Any]:
     sender_domain = safe_clean_domain(req.senderDomain)
     mailed_by = safe_clean_domain(req.mailedBy)
     signed_by = safe_clean_domain(req.signedBy)
@@ -624,11 +656,17 @@ def count_followups(history: List[ChatMessage]) -> int:
 # -----------------------------
 @app.post("/ai/chat", response_model=ChatResponse)
 def ai_chat(req: ChatRequest):
-    require_api_key()
+    require_openai_api_key()
 
-    mode = (req.mode or "free").lower().strip()
-    if mode not in ("free", "pro"):
-        mode = "free"
+    # -----------------------------
+    # NEW: server-side plan enforcement from license
+    # -----------------------------
+    license_info = license_validate_or_free_fallback(req.licenseKey, req.deviceId)
+    mode_from_db = (license_info.get("mode") or "free").lower().strip()
+    if mode_from_db not in ("free", "pro"):
+        mode_from_db = "free"
+
+    mode = mode_from_db  # override client hint with server truth
 
     # Follow-ups are Pro-only. Free users get the initial analysis only.
     if (req.userMessage and req.userMessage.strip()) and mode == "free":
@@ -696,6 +734,10 @@ def ai_chat(req: ChatRequest):
         reply = (completion.choices[0].message.content or "").strip()
         if not reply:
             raise ValueError("Empty reply")
+
+        # Best-effort usage tracking (won't break user experience)
+        usage_increment_best_effort(req.licenseKey, amount=1)
+
         return ChatResponse(reply=reply)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI chat failed: {str(e)}")
