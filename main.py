@@ -570,9 +570,7 @@ from sqlalchemy import text
 
 @app.get("/health")
 def health():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"ok": True, "db": "ok"}
+    return {"ok": True}
 
 
 @app.post("/ai/chat", response_model=ChatResponse)
