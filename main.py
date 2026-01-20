@@ -1,16 +1,13 @@
 import os
 import re
-from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
-
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
 
 
 # =============================================================================
@@ -38,7 +35,7 @@ PlanMode = Literal["free", "pro"]
 # -----------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-app = FastAPI(title="AI Mail Genie AI API", version="3.0.0")
+app = FastAPI(title="AI Mail Genie AI API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,31 +47,60 @@ app.add_middleware(
 
 
 # -----------------------------
-# DB (optional for now)
+# Cloudflare Worker DB API (D1 Gateway)
 # -----------------------------
-def build_engine():
-    # Preferred: separate env vars (avoid URL-encoding issues)
-    host = os.environ.get("DB_HOST")
-    name = os.environ.get("DB_NAME")
-    user = os.environ.get("DB_USER")
-    password = os.environ.get("DB_PASSWORD")
-    port = int(os.environ.get("DB_PORT", "3306"))
-
-    if not all([host, name, user, password]):
-        return None
-
-    url = URL.create(
-        drivername="mysql+pymysql",
-        username=user,
-        password=password,
-        host=host,
-        port=port,
-        database=name,
-    )
-    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
+DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
+DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
 
-engine = build_engine()
+def require_api_key():
+    k = os.environ.get("OPENAI_API_KEY", "")
+    if not k or not k.startswith("sk-"):
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set or invalid")
+
+
+def require_db_api_config():
+    if not DB_API_URL or not DB_API_KEY:
+        raise HTTPException(status_code=500, detail="DB_API_URL / DB_API_KEY not configured")
+
+
+def db_get(path: str, timeout: int = 15) -> Dict[str, Any]:
+    require_db_api_config()
+    url = f"{DB_API_URL}{path}"
+    try:
+        r = requests.get(url, headers={"X-DB-KEY": DB_API_KEY}, timeout=timeout)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"DB API unreachable: {str(e)}")
+
+    if r.status_code >= 400:
+        try:
+            raise HTTPException(status_code=r.status_code, detail=r.json())
+        except Exception:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    return r.json()
+
+
+def db_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+    require_db_api_config()
+    url = f"{DB_API_URL}{path}"
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            headers={"X-DB-KEY": DB_API_KEY},
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"DB API unreachable: {str(e)}")
+
+    if r.status_code >= 400:
+        try:
+            raise HTTPException(status_code=r.status_code, detail=r.json())
+        except Exception:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    return r.json()
 
 
 # -----------------------------
@@ -82,33 +108,38 @@ engine = build_engine()
 # -----------------------------
 @app.get("/health")
 def health():
-    # Always stable: confirms API is up
     return {"ok": True}
 
 
 @app.get("/health/db")
 def health_db():
-    # Safe DB diagnostic: does not break /health
-    if engine is None:
+    # Checks the Cloudflare Worker + D1 health endpoint
+    if not DB_API_URL or not DB_API_KEY:
         return {"ok": True, "db": "not_configured"}
 
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"ok": True, "db": "ok"}
-    except Exception as e:
-        return {"ok": True, "db": "error", "detail": str(e)[:200]}
+        data = db_get("/health/db", timeout=15)
+        return {"ok": True, "db": data}
+    except HTTPException as e:
+        # keep /health/db non-fatal: return error details without breaking /health
+        return {"ok": True, "db": "error", "detail": str(e.detail)[:300]}
+
+
+# -----------------------------
+# TEMP DEBUG ENDPOINT (remove after you confirm env is correct)
+# -----------------------------
+@app.get("/debug/db")
+def debug_db():
+    # Do NOT expose secrets. Only return URL presence.
+    return {
+        "db_api_url": DB_API_URL,
+        "db_api_key_set": bool(DB_API_KEY),
+    }
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def require_api_key():
-    k = os.environ.get("OPENAI_API_KEY", "")
-    if not k or not k.startswith("sk-"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set or invalid")
-
-
 def safe_clean_domain(d: str) -> str:
     d = (d or "").strip().lower()
     d = re.sub(r"[^a-z0-9.\-]", "", d)
