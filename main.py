@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException
@@ -7,9 +8,50 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
+
+# =============================================================================
+# AI Mail Genie Server (FastAPI)
+#
+# Design:
+# - Deterministic server-side verdict layer:
+#     SAFE / CAUTION / HIGH RISK with confidence
+# - Model must follow the server verdict exactly (no hedging).
+# - No claims about SPF/DKIM/DMARC/DNS/bank ownership unless explicitly provided.
+# - Privacy: snippet is already redacted client-side; server re-redacts as a backstop.
+#
+# Monetization-ready:
+# - mode = "free" or "pro"
+#   - Free: initial analysis only
+#   - Pro: follow-ups + deep-dive sections
+# =============================================================================
+
+Verdict = Literal["SAFE", "CAUTION", "HIGH RISK"]
+PlanMode = Literal["free", "pro"]
+
+
+# -----------------------------
+# OpenAI / App init (MUST be before @app routes)
+# -----------------------------
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+app = FastAPI(title="AI Mail Genie AI API", version="3.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # DEV ONLY (lock down later)
+    allow_credentials=False,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+# -----------------------------
+# DB (optional for now)
+# -----------------------------
 def build_engine():
     # Preferred: separate env vars (avoid URL-encoding issues)
     host = os.environ.get("DB_HOST")
@@ -31,10 +73,22 @@ def build_engine():
     )
     return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
 
+
 engine = build_engine()
+
+
+# -----------------------------
+# Health endpoints
+# -----------------------------
+@app.get("/health")
+def health():
+    # Always stable: confirms API is up
+    return {"ok": True}
+
 
 @app.get("/health/db")
 def health_db():
+    # Safe DB diagnostic: does not break /health
     if engine is None:
         return {"ok": True, "db": "not_configured"}
 
@@ -45,27 +99,10 @@ def health_db():
     except Exception as e:
         return {"ok": True, "db": "error", "detail": str(e)[:200]}
 
-# =============================================================================
-# AI Mail Genie Server (FastAPI)
-#
-# Design:
-# - Deterministic server-side verdict layer:
-#     SAFE / CAUTION / HIGH RISK with confidence
-# - Model must follow the server verdict exactly (no hedging).
-# - No claims about SPF/DKIM/DMARC/DNS/bank ownership unless explicitly provided.
-# - Privacy: snippet is already redacted client-side; server re-redacts as a backstop.
-#
-# Monetization-ready:
-# - mode = "free" or "pro"
-#   - Free: initial analysis only
-#   - Pro: follow-ups + deep-dive sections
-# =============================================================================
 
-
-Verdict = Literal["SAFE", "CAUTION", "HIGH RISK"]
-PlanMode = Literal["free", "pro"]
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def require_api_key():
     k = os.environ.get("OPENAI_API_KEY", "")
     if not k or not k.startswith("sk-"):
@@ -93,58 +130,25 @@ def redact_text(t: str) -> str:
 
 
 def classify_noise(subject: str, snippet: str) -> Dict[str, Any]:
-    """Deterministic, lightweight noise classifier.
-
-    Categories are intentionally coarse; used to reduce false positives and
-    provide user-facing context.
-    """
     subj = (subject or "").lower()
     snip = (snippet or "").lower()
-    text = f"{subj}\n{snip}"
+    text2 = f"{subj}\n{snip}"
 
-    # Newsletter / marketing
-    if any(x in text for x in ["unsubscribe", "view in browser", "newsletter", "marketing", "preferences", "promotions"]):
+    if any(x in text2 for x in ["unsubscribe", "view in browser", "newsletter", "marketing", "preferences", "promotions"]):
         return {"category": "newsletter", "confidence": 0.78}
 
-    # Transactional receipts / alerts
-    if any(x in text for x in ["receipt", "order", "invoice", "payment", "subscription", "delivery", "shipped", "tracking", "statement"]):
+    if any(x in text2 for x in ["receipt", "order", "invoice", "payment", "subscription", "delivery", "shipped", "tracking", "statement"]):
         return {"category": "transactional", "confidence": 0.70}
 
-    # Cold outreach / sales
-    if any(x in text for x in ["quick call", "book a meeting", "calendar", "demo", "pricing", "proposal", "partnership", "reach out"]):
+    if any(x in text2 for x in ["quick call", "book a meeting", "calendar", "demo", "pricing", "proposal", "partnership", "reach out"]):
         return {"category": "sales", "confidence": 0.68}
 
     return {"category": "unknown", "confidence": 0.55}
 
 
-def sanitize_history_for_followups(history: List["ChatMessage"]) -> List["ChatMessage"]:
-    """Reduce repetition risk by trimming and shortening history.
-
-    We keep only the last few user questions and short assistant replies.
-    We also drop the full initial report if it was stored in history.
-    """
-    if not history:
-        return []
-
-    trimmed: List[ChatMessage] = []
-    for h in history[-10:]:
-        c = (h.content or "").strip()
-        if not c:
-            continue
-
-        # Drop the full initial report if it was stored in history.
-        if h.role == "assistant" and "VERDICT:" in c and "WHAT I CHECKED" in c and len(c) > 900:
-            continue
-
-        # Cap assistant message length to reduce looping.
-        if h.role == "assistant" and len(c) > 700:
-            c = c[:700] + "…"
-
-        trimmed.append(ChatMessage(role=h.role, content=c[:2000]))
-
-    return trimmed
-
-
+# -----------------------------
+# Link / domain helpers
+# -----------------------------
 def domain_from_url(url: str) -> str:
     try:
         m = re.match(r"^https?://([^/]+)", (url or "").strip(), flags=re.I)
@@ -193,7 +197,6 @@ def normalize_for_lookalike(s: str) -> str:
 
 
 def lookalike_score(a: str, b: str) -> int:
-    # 0 none, 1 weak, 2 medium, 3 strong
     a = safe_clean_domain(a)
     b = safe_clean_domain(b)
     if not a or not b or a == b:
@@ -229,8 +232,8 @@ def compute_link_signals(sender_domain: str, link_urls: List[str], link_domains:
         "has_punycode_link": False,
         "has_shortener": False,
         "has_sender_mismatch_domains": False,
-        "lookalike_domains": [],     # [{domain, score}]
-        "mismatch_domains": [],      # [{domain}]
+        "lookalike_domains": [],
+        "mismatch_domains": [],
     }
 
     for d in domains:
@@ -265,17 +268,12 @@ def decide_verdict(
     link_signals: Dict[str, Any],
     strictness: str = "normal",
 ) -> Tuple[Verdict, float, List[str]]:
-    """
-    Returns (verdict, confidence, reasons_for_verdict).
-    This is intentionally deterministic to avoid model hedging.
-    """
     sender_domain = safe_clean_domain(sender_domain)
     mailed_by = safe_clean_domain(mailed_by)
     signed_by = safe_clean_domain(signed_by)
 
     reasons: List[str] = []
 
-    # Strong red flags (independent)
     strong_flags = 0
     if payment_changed:
         strong_flags += 1
@@ -294,7 +292,6 @@ def decide_verdict(
         strong_flags += 1
         reasons.append("A link domain looks similar to the sender domain (possible lookalike).")
 
-    # Moderate flags
     moderate_flags = 0
     if link_signals.get("has_shortener"):
         moderate_flags += 1
@@ -304,12 +301,10 @@ def decide_verdict(
         moderate_flags += 1
         reasons.append("Link domains differ from the sender domain (moderate risk).")
 
-    # Legitimacy signals (can offset moderate flags)
     legitimacy = 0
     if sender_domain:
         legitimacy += 1
 
-    # If mailed-by / signed-by matches sender domain, treat as supportive (not definitive).
     if mailed_by and sender_domain and (mailed_by == sender_domain or mailed_by.endswith("." + sender_domain)):
         legitimacy += 1
         reasons.append("Mailed-by matches sender domain (supporting signal).")
@@ -317,39 +312,26 @@ def decide_verdict(
         legitimacy += 1
         reasons.append("Signed-by matches sender domain (supporting signal).")
 
-    # Strictness adjustments (Pro feature):
-    # - strict_finance: be more conservative when payment intent exists.
-    # - low_noise: be slightly less sensitive to mismatch domains for newsletters.
     strict_finance = (strictness or "").lower() == "strict_finance"
     low_noise = (strictness or "").lower() == "low_noise"
 
     if low_noise and moderate_flags > 0 and not payment_changed:
-        # Reduce moderate impact a bit in low-noise mode.
         moderate_flags = max(0, moderate_flags - 1)
 
-    # Decision policy:
-    # HIGH RISK only with 2+ strong flags OR 1 strong + 2 moderate.
     if strong_flags >= 2 or (strong_flags >= 1 and moderate_flags >= 2):
         confidence = 0.85 if strong_flags >= 2 else 0.75
         return "HIGH RISK", confidence, reasons
 
-    # SAFE when no strong flags, and either:
-    # - no moderate flags, OR
-    # - moderate flags exist but legitimacy signals are strong and payment_changed is false
     if strong_flags == 0:
         if moderate_flags == 0:
             return "SAFE", 0.82, reasons
-        # Moderate flags present: require legitimacy >= 2 to call SAFE
         if legitimacy >= 2 and not payment_changed:
             return "SAFE", 0.72, reasons
 
-    # Otherwise CAUTION
     base_conf = 0.62
-    # If payment intent but no strong flags, still caution and advise verification without panic.
     if payment_intent and moderate_flags > 0:
         base_conf = 0.60
     if strict_finance and payment_intent and strong_flags == 0:
-        # In finance mode, err on caution for any payment-related email.
         base_conf = min(base_conf, 0.58)
     return "CAUTION", base_conf, reasons
 
@@ -384,12 +366,10 @@ class ChatRequest(BaseModel):
     userMessage: Optional[str] = Field(default=None, max_length=2000)
     history: List[ChatMessage] = Field(default_factory=list)
 
-    # monetization / plan gating
-    mode: PlanMode = "free"  # free | pro
-    # Optional client hint; server still enforces based on `mode`.
+    # monetization / plan gating (client hint for now)
+    mode: PlanMode = "free"
     strictness: Literal["normal", "strict_finance", "low_noise"] = "normal"
 
-    # follow-up limit (Pro backstop)
     followupCount: Optional[int] = None
     maxFollowups: int = 5
 
@@ -399,7 +379,6 @@ class ChatResponse(BaseModel):
 
 
 def upgrade_required_reply() -> str:
-    # Keep deterministic, client-ready, and consistent with UI lock.
     return (
         "VERDICT: CAUTION\n"
         "CONFIDENCE: 0.50\n\n"
@@ -420,20 +399,8 @@ def upgrade_required_reply() -> str:
 
 
 # -----------------------------
-# OpenAI / App init
+# System prompts
 # -----------------------------
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-app = FastAPI(title="AI Mail Genie AI API", version="3.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # DEV ONLY
-    allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-
 SYSTEM_CHAT_FREE_INITIAL = """
 You are AI Mail Genie, a client-facing email security assistant.
 
@@ -539,6 +506,27 @@ CRITICAL RULES:
 """
 
 
+def sanitize_history_for_followups(history: List["ChatMessage"]) -> List["ChatMessage"]:
+    if not history:
+        return []
+
+    trimmed: List[ChatMessage] = []
+    for h in history[-10:]:
+        c = (h.content or "").strip()
+        if not c:
+            continue
+
+        if h.role == "assistant" and "VERDICT:" in c and "WHAT I CHECKED" in c and len(c) > 900:
+            continue
+
+        if h.role == "assistant" and len(c) > 700:
+            c = c[:700] + "…"
+
+        trimmed.append(ChatMessage(role=h.role, content=c[:2000]))
+
+    return trimmed
+
+
 def build_context(req: ChatRequest) -> Dict[str, Any]:
     sender_domain = safe_clean_domain(req.senderDomain)
     mailed_by = safe_clean_domain(req.mailedBy)
@@ -602,13 +590,9 @@ def count_followups(history: List[ChatMessage]) -> int:
     return sum(1 for h in (history or []) if h.role == "user")
 
 
-from sqlalchemy import text
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
+# -----------------------------
+# Core endpoint
+# -----------------------------
 @app.post("/ai/chat", response_model=ChatResponse)
 def ai_chat(req: ChatRequest):
     require_api_key()
@@ -660,7 +644,6 @@ def ai_chat(req: ChatRequest):
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt.strip()}]
 
-    # Reduce repetition risk on follow-ups.
     history = sanitize_history_for_followups(req.history) if is_followup else (req.history or [])
     for h in (history or [])[:12]:
         messages.append({"role": h.role, "content": (h.content or "")[:2000]})
