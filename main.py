@@ -7,7 +7,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 
+def build_engine():
+    # Preferred: separate env vars (avoid URL-encoding issues)
+    host = os.environ.get("DB_HOST")
+    name = os.environ.get("DB_NAME")
+    user = os.environ.get("DB_USER")
+    password = os.environ.get("DB_PASSWORD")
+    port = int(os.environ.get("DB_PORT", "3306"))
+
+    if not all([host, name, user, password]):
+        return None
+
+    url = URL.create(
+        drivername="mysql+pymysql",
+        username=user,
+        password=password,
+        host=host,
+        port=port,
+        database=name,
+    )
+    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
+
+engine = build_engine()
 
 # =============================================================================
 # AI Mail Genie Server (FastAPI)
