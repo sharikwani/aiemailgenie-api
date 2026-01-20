@@ -2,9 +2,8 @@ fastapi
 uvicorn[standard]
 pydantic
 openai
-SQLAlchemy
-PyMySQL
 python-jose[cryptography]
 python-dotenv
 requests==2.32.3
+
 
