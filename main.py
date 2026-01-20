@@ -566,9 +566,13 @@ def count_followups(history: List[ChatMessage]) -> int:
     return sum(1 for h in (history or []) if h.role == "user")
 
 
+from sqlalchemy import text
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"ok": True, "db": "ok"}
 
 
 @app.post("/ai/chat", response_model=ChatResponse)
