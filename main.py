@@ -33,6 +33,18 @@ def build_engine():
 
 engine = build_engine()
 
+@app.get("/health/db")
+def health_db():
+    if engine is None:
+        return {"ok": True, "db": "not_configured"}
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"ok": True, "db": "ok"}
+    except Exception as e:
+        return {"ok": True, "db": "error", "detail": str(e)[:200]}
+
 # =============================================================================
 # AI Mail Genie Server (FastAPI)
 #
