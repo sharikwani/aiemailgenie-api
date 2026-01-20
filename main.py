@@ -128,8 +128,6 @@ def health_db():
 # -----------------------------
 # TEMP DEBUG ENDPOINT (remove after you confirm env is correct)
 # -----------------------------
-@app.get("/debug/db")
-def debug_db():
     # Do NOT expose secrets. Only return URL presence.
     return {
         "db_api_url": DB_API_URL,
