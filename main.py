@@ -347,48 +347,53 @@ def decide_verdict(
 # -----------------------------
 def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
     """
-    Calls Worker /license/validate with auto-activation.
-    Safe fallback to free mode on any failure.
-
-    Normalized return:
-      { ok: True, mode: "free"|"pro", reason?: str, plan?: {...}, license_id?: int }
+    Calls Worker /license/validate.
+    Worker returns: { valid: bool, reason?: str, plan?: {...} }
+    We convert that into a server-authoritative mode: free|pro
     """
     license_key = (license_key or "").strip()
     device_id = (device_id or "").strip()
 
-    # No license or device => free
+    # No license/device => free
     if not license_key or not device_id:
-        return {"ok": True, "mode": "free", "reason": "missing_license_or_device"}
+        return {"ok": True, "mode": "free"}
 
     # If DB API isn't configured, do not break the app; default free
     if not DB_API_URL or not DB_API_KEY:
-        return {"ok": True, "mode": "free", "reason": "db_not_configured"}
+        return {"ok": True, "mode": "free"}
 
     try:
         data = db_post(
             "/license/validate",
-            {"license_key": license_key, "device_id": device_id, "auto_activate": True},
+            {
+                "license_key": license_key,
+                "device_id": device_id,
+                "auto_activate": True,  # harmless if Worker ignores
+            },
             timeout=12,
         )
 
-        if not isinstance(data, dict) or data.get("ok") is not True:
-            return {"ok": True, "mode": "free", "reason": "unexpected_response"}
+        # Expected Worker shape
+        if isinstance(data, dict) and data.get("valid") is True:
+            plan = data.get("plan") or {}
+            plan_name = (plan.get("name") or "pro").lower().strip()
+            mode = "pro" if plan_name in ("pro", "paid", "premium") else "pro"
+            return {
+                "ok": True,
+                "mode": mode,
+                "license_id": data.get("license_id"),
+                "plan": plan,
+            }
 
-        valid = bool(data.get("valid"))
-        if not valid:
-            return {"ok": True, "mode": "free", "reason": str(data.get("reason") or "invalid")}
-
-        return {
-            "ok": True,
-            "mode": "pro",
-            "license_id": data.get("license_id"),
-            "plan": data.get("plan") or {},
-        }
+        # Invalid license -> free
+        reason = (data.get("reason") if isinstance(data, dict) else "") or "invalid"
+        return {"ok": True, "mode": "free", "reason": reason}
 
     except HTTPException as e:
+        # Fail-safe to free
         return {"ok": True, "mode": "free", "reason": f"db_error_{e.status_code}"}
     except Exception:
-        return {"ok": True, "mode": "free", "reason": "db_error_unknown"}
+        return {"ok": True, "mode": "free", "reason": "db_error"}
 
 
 def usage_increment_best_effort(license_key: str, device_id: str, amount: int = 1) -> None:
