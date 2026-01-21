@@ -3,7 +3,8 @@ import re
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException
+import stripe
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -23,7 +24,7 @@ PlanMode = Literal["free", "pro"]
 # -----------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-app = FastAPI(title="AI Mail Genie AI API", version="3.2.1")
+app = FastAPI(title="AI Mail Genie AI API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,6 +93,63 @@ def db_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, 
 
 
 # -----------------------------
+# Stripe config
+# -----------------------------
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+
+# Optional: set these if you want strict mapping from Stripe Price IDs to plans.
+# Example:
+#   STRIPE_PRICE_PRO_LIFETIME=price_123
+#   STRIPE_PRICE_PRO_YEARLY=price_456
+STRIPE_PRICE_PRO_LIFETIME = os.environ.get("STRIPE_PRICE_PRO_LIFETIME", "").strip()
+STRIPE_PRICE_PRO_YEARLY = os.environ.get("STRIPE_PRICE_PRO_YEARLY", "").strip()
+
+
+def require_stripe_config():
+    if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET not configured")
+
+
+def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
+    """
+    Map Stripe Price ID -> license creation parameters.
+    Defaults to lifetime Pro if no mapping is configured.
+    """
+    pid = (price_id or "").strip()
+
+    # Default settings (your current target: one-time Pro purchase, lifetime)
+    plan = "pro"
+    duration_days = None  # None == lifetime (Worker should treat as no expiry)
+    max_devices = 1
+    daily_limit = 500
+
+    if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
+        return {
+            "plan": "pro",
+            "duration_days": None,
+            "max_devices": 1,
+            "daily_limit": 500,
+        }
+
+    if STRIPE_PRICE_PRO_YEARLY and pid == STRIPE_PRICE_PRO_YEARLY:
+        return {
+            "plan": "pro",
+            "duration_days": 365,
+            "max_devices": 1,
+            "daily_limit": 500,
+        }
+
+    # Fallback: treat as Pro lifetime (keeps fulfillment resilient during early setup)
+    return {
+        "plan": plan,
+        "duration_days": duration_days,
+        "max_devices": max_devices,
+        "daily_limit": daily_limit,
+    }
+
+
+# -----------------------------
 # Health endpoints
 # -----------------------------
 @app.get("/health")
@@ -110,6 +168,119 @@ def health_db():
         return {"ok": True, "db": data}
     except HTTPException as e:
         return {"ok": True, "db": "error", "detail": str(e.detail)[:300]}
+
+
+# -----------------------------
+# Stripe Webhook (Checkout fulfillment)
+# -----------------------------
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    """
+    Receives Stripe events.
+    Primary event: checkout.session.completed
+
+    Responsibilities:
+      - Verify Stripe signature
+      - Extract customer email
+      - Resolve plan from price_id
+      - Call Worker admin endpoint to create license: POST /admin/license/create
+
+    Note:
+      - For Payment Links / Checkout, line items are not always present in the event payload.
+        We retrieve the session with expand=['line_items.data.price'] to get price IDs reliably.
+    """
+    require_stripe_config()
+    if not DB_API_URL or not DB_API_KEY:
+        raise HTTPException(status_code=500, detail="DB_API_URL / DB_API_KEY not configured")
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception:
+        # Stripe expects 4xx on signature failures
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+
+    event_type = event.get("type", "")
+    if event_type != "checkout.session.completed":
+        # Acknowledge other events (Stripe will retry if non-2xx)
+        return {"ok": True, "ignored": True, "type": event_type}
+
+    session = (event.get("data") or {}).get("object") or {}
+    session_id = session.get("id", "")
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session id")
+
+    # Retrieve full session with line items expanded to obtain price_id
+    try:
+        full_session = stripe.checkout.Session.retrieve(
+            session_id,
+            expand=["line_items.data.price"],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Stripe retrieve failed: {str(e)}")
+
+    # Email extraction (Stripe can provide customer_details.email or customer_email)
+    email = ""
+    try:
+        cd = getattr(full_session, "customer_details", None) or {}
+        email = (cd.get("email") if isinstance(cd, dict) else "") or ""
+    except Exception:
+        email = ""
+
+    if not email:
+        email = getattr(full_session, "customer_email", "") or ""
+
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Missing customer email")
+
+    # Get first line item's price id (one-time purchase)
+    price_id = ""
+    try:
+        line_items = getattr(full_session, "line_items", None)
+        data = (line_items.get("data") if isinstance(line_items, dict) else None) or []
+        if data:
+            price = data[0].get("price") or {}
+            price_id = (price.get("id") or "").strip()
+    except Exception:
+        price_id = ""
+
+    # If price_id is missing, still proceed with fallback plan (keeps fulfillment robust)
+    plan_payload = resolve_plan_from_price_id(price_id)
+
+    # Idempotency: you should enforce idempotency in the Worker using session_id if possible.
+    # For now, we pass stripe_session_id so Worker can dedupe if you add it later.
+    try:
+        created = db_post(
+            "/admin/license/create",
+            {
+                "email": email,
+                "plan": plan_payload["plan"],
+                "duration_days": plan_payload["duration_days"],
+                "max_devices": plan_payload["max_devices"],
+                "daily_limit": plan_payload["daily_limit"],
+                "stripe_session_id": session_id,
+                "stripe_price_id": price_id,
+            },
+            timeout=20,
+        )
+    except HTTPException as e:
+        # Return 500 so Stripe retries; avoids losing a paid customer fulfillment
+        raise HTTPException(status_code=500, detail={"license_create_failed": True, "db_error": e.detail})
+
+    # TODO: Send email with license key (Resend/SendGrid/etc.). Keep webhook fast and reliable.
+    # You can implement email sending after confirming license creation works end-to-end.
+
+    return {"ok": True, "fulfilled": True, "license": created}
 
 
 # -----------------------------
