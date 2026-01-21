@@ -348,52 +348,52 @@ def decide_verdict(
 def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
     """
     Calls Worker /license/validate.
-    Worker returns: { valid: bool, reason?: str, plan?: {...} }
-    We convert that into a server-authoritative mode: free|pro
+    Accepts BOTH response formats:
+      A) Worker format: {"valid": true, "plan": {...}}
+      B) Legacy format: {"ok": true, "mode": "pro"}
+    Fails safe to free if anything is wrong.
     """
     license_key = (license_key or "").strip()
     device_id = (device_id or "").strip()
 
-    # No license/device => free
+    # No license provided => free
     if not license_key or not device_id:
         return {"ok": True, "mode": "free"}
 
-    # If DB API isn't configured, do not break the app; default free
+    # DB API not configured => free
     if not DB_API_URL or not DB_API_KEY:
         return {"ok": True, "mode": "free"}
 
     try:
-        data = db_post(
-            "/license/validate",
-            {
-                "license_key": license_key,
-                "device_id": device_id,
-                "auto_activate": True,  # harmless if Worker ignores
-            },
-            timeout=12,
-        )
+        data = db_post("/license/validate", {"license_key": license_key, "device_id": device_id}, timeout=12)
 
-        # Expected Worker shape
-        if isinstance(data, dict) and data.get("valid") is True:
-            plan = data.get("plan") or {}
-            plan_name = (plan.get("name") or "pro").lower().strip()
-            mode = "pro" if plan_name in ("pro", "paid", "premium") else "pro"
-            return {
-                "ok": True,
-                "mode": mode,
-                "license_id": data.get("license_id"),
-                "plan": plan,
-            }
+        # --- Format A: Worker returns {"valid": true/false, plan: {...}} ---
+        if isinstance(data, dict) and "valid" in data:
+            if data.get("valid") is True:
+                plan = data.get("plan") or {}
+                return {
+                    "ok": True,
+                    "mode": "pro",
+                    "license_id": data.get("license_id"),
+                    "plan": plan,
+                }
+            return {"ok": True, "mode": "free", "reason": data.get("reason", "invalid")}
 
-        # Invalid license -> free
-        reason = (data.get("reason") if isinstance(data, dict) else "") or "invalid"
-        return {"ok": True, "mode": "free", "reason": reason}
+        # --- Format B: Legacy returns {"ok": true, "mode": "pro"} ---
+        if isinstance(data, dict) and data.get("ok") is True:
+            mode = (data.get("mode") or "free").lower().strip()
+            return {"ok": True, "mode": "pro" if mode == "pro" else "free"}
+
+        return {"ok": True, "mode": "free"}
 
     except HTTPException as e:
-        # Fail-safe to free
-        return {"ok": True, "mode": "free", "reason": f"db_error_{e.status_code}"}
+        # If endpoint missing or errors, fail safe to free (no crashes)
+        if e.status_code == 404:
+            return {"ok": True, "mode": "free"}
+        return {"ok": True, "mode": "free"}
+
     except Exception:
-        return {"ok": True, "mode": "free", "reason": "db_error"}
+        return {"ok": True, "mode": "free"}
 
 
 def usage_increment_best_effort(license_key: str, device_id: str, amount: int = 1) -> None:
