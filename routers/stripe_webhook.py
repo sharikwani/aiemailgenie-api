@@ -1,19 +1,18 @@
 import os
-import json
 from typing import Optional, Tuple, Dict, Any
 
 import requests
 import stripe
 from fastapi import APIRouter, Request, HTTPException
 
-
 router = APIRouter()
 
 # -----------------------------
 # Stripe config
 # -----------------------------
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+stripe.api_key = STRIPE_SECRET_KEY
 
 # -----------------------------
 # Worker DB API config
@@ -29,7 +28,7 @@ FROM_EMAIL = os.getenv("FROM_EMAIL", "license@aiemailgenie.com").strip()
 
 
 def _require_env_or_500():
-    if not stripe.api_key:
+    if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not set")
     if not WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not set")
@@ -50,7 +49,6 @@ def _worker_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[
         raise HTTPException(status_code=502, detail=f"Worker DB API unreachable: {str(e)}")
 
     if r.status_code >= 400:
-        # expose minimal debug info
         try:
             raise HTTPException(status_code=r.status_code, detail=r.json())
         except Exception:
@@ -63,9 +61,7 @@ def _send_license_email_resend(to_email: str, license_key: str, plan_name: str) 
     """
     Best-effort email: never raises to break Stripe fulfillment.
     """
-    if not RESEND_API_KEY:
-        return
-    if not to_email:
+    if not RESEND_API_KEY or not to_email:
         return
 
     subject = "Your AI Mail Genie Pro License Key"
@@ -111,14 +107,12 @@ def _resolve_plan_from_price_id(price_id: Optional[str]) -> Tuple[str, Optional[
     """
     Map Stripe price IDs to (plan_name, duration_days).
 
-    For your stated goal (one-time Pro purchase), this can be very simple:
-      - price_id == STRIPE_PRICE_ID_PRO -> ("pro", None)  # lifetime
-    Or set STRIPE_PRO_DURATION_DAYS for time-limited Pro.
-
-    You can expand later for multiple products.
+    Environment variables:
+      STRIPE_PRICE_ID_PRO       -> the Stripe Price ID for Pro
+      STRIPE_PRO_DURATION_DAYS  -> optional, e.g. "365" for yearly
     """
     pro_price = os.getenv("STRIPE_PRICE_ID_PRO", "").strip()
-    pro_days_raw = os.getenv("STRIPE_PRO_DURATION_DAYS", "").strip()  # e.g. "365" or ""
+    pro_days_raw = os.getenv("STRIPE_PRO_DURATION_DAYS", "").strip()
 
     if pro_price and price_id == pro_price:
         if pro_days_raw:
@@ -134,13 +128,6 @@ def _resolve_plan_from_price_id(price_id: Optional[str]) -> Tuple[str, Optional[
     return "pro", None
 
 
-def _get_customer_email(session_obj: Dict[str, Any]) -> str:
-    # Stripe can provide email in a few places
-    cd = session_obj.get("customer_details") or {}
-    email = cd.get("email") or session_obj.get("customer_email") or ""
-    return (email or "").strip().lower()
-
-
 def _get_first_price_id(session_obj: Dict[str, Any]) -> Optional[str]:
     """
     Requires session with line_items expanded.
@@ -152,7 +139,44 @@ def _get_first_price_id(session_obj: Dict[str, Any]) -> Optional[str]:
 
     first = data[0] or {}
     price = first.get("price") or {}
-    return price.get("id")
+    return (price.get("id") or "").strip() or None
+
+
+def _get_customer_email_from_session(session_obj: Dict[str, Any]) -> str:
+    cd = session_obj.get("customer_details") or {}
+    email = cd.get("email") or session_obj.get("customer_email") or ""
+    return (email or "").strip().lower()
+
+
+def _try_fetch_email_from_customer(customer_id: Optional[str]) -> str:
+    if not customer_id:
+        return ""
+    try:
+        cust = stripe.Customer.retrieve(customer_id)
+        # StripeObject supports dict-style access in many cases
+        email = getattr(cust, "email", None) or (cust.get("email") if isinstance(cust, dict) else None) or ""
+        return (email or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _try_fetch_email_from_payment_intent(payment_intent_id: Optional[str]) -> str:
+    """
+    Last resort: look at payment_intent -> latest_charge -> billing_details.email
+    """
+    if not payment_intent_id:
+        return ""
+    try:
+        pi = stripe.PaymentIntent.retrieve(payment_intent_id, expand=["latest_charge"])
+        latest_charge = getattr(pi, "latest_charge", None)
+        if not latest_charge:
+            return ""
+        # latest_charge can be StripeObject
+        bd = getattr(latest_charge, "billing_details", None) or {}
+        email = bd.get("email") if isinstance(bd, dict) else getattr(bd, "email", "") or ""
+        return (email or "").strip().lower()
+    except Exception:
+        return ""
 
 
 @router.post("/stripe/webhook")
@@ -172,53 +196,64 @@ async def stripe_webhook(request: Request):
     if not sig:
         raise HTTPException(status_code=400, detail="Missing Stripe signature header")
 
-    # Verify and parse event
+    # Verify event
     try:
         event = stripe.Webhook.construct_event(payload_bytes, sig, WEBHOOK_SECRET)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # Only handle Checkout completion
-    if event.get("type") != "checkout.session.completed":
-        return {"ok": True, "ignored": True, "type": event.get("type")}
+    event_type = event.get("type")
+    if event_type != "checkout.session.completed":
+        return {"ok": True, "ignored": True, "type": event_type}
 
     session = event.get("data", {}).get("object", {}) or {}
     session_id = session.get("id")
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session id")
 
-    # Retrieve full session with line_items expanded (reliable price_id source)
+    # Retrieve full session with line_items expanded
     try:
         full_session = stripe.checkout.Session.retrieve(
             session_id,
             expand=["line_items.data.price"],
         )
-        # stripe returns a StripeObject; convert to plain dict safely
-        full_session_dict = json.loads(str(full_session))
+        # Correct conversion
+        full_session_dict = full_session.to_dict_recursive()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to retrieve session: {str(e)}")
 
-    customer_email = _get_customer_email(full_session_dict)
+    # Extract email (multi-fallback)
+    customer_email = _get_customer_email_from_session(full_session_dict)
+
+    if not customer_email:
+        customer_email = _try_fetch_email_from_customer(full_session_dict.get("customer"))
+
+    if not customer_email:
+        customer_email = _try_fetch_email_from_payment_intent(full_session_dict.get("payment_intent"))
+
+    if not customer_email or "@" not in customer_email:
+        # Better to fail so Stripe retries than silently losing fulfillment
+        raise HTTPException(status_code=400, detail="Could not determine customer email from Stripe session")
+
     price_id = _get_first_price_id(full_session_dict)
     plan_name, duration_days = _resolve_plan_from_price_id(price_id)
 
     # Create license in Worker
-    worker_payload = {
+    worker_payload: Dict[str, Any] = {
         "email": customer_email,
         "plan": plan_name,
-        "duration_days": duration_days,     # None => lifetime
-        "max_devices": None,                # your Worker ignores per-license; plan defines it
-        "daily_limit": None,                # your Worker ignores per-license; plan defines it
-        "stripe_session_id": session_id,    # currently ignored by Worker (safe to send)
-        "stripe_price_id": price_id,        # currently ignored by Worker (safe to send)
+        "duration_days": duration_days,      # None => lifetime
+        "stripe_session_id": session_id,
+        "stripe_price_id": price_id,
     }
 
-    lic = _worker_post("/admin/license/create", worker_payload, timeout=15)
+    lic = _worker_post("/admin/license/create", worker_payload, timeout=20)
+
     license_key = (lic.get("license_key") or "").strip()
     if not license_key:
         raise HTTPException(status_code=502, detail="Worker did not return a license_key")
 
-    # Send license email (best-effort; does not block Stripe 200)
+    # Send license email (best-effort)
     _send_license_email_resend(customer_email, license_key, plan_name)
 
     return {
