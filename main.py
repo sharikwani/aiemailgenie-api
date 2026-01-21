@@ -41,6 +41,35 @@ app.add_middleware(
 DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
 DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
+def send_license_email(to_email: str, license_key: str):
+    api_key = os.environ.get("RESEND_API_KEY")
+    from_email = os.environ.get("FROM_EMAIL", "license@aiemailgenie.com")
+
+    if not api_key or not to_email:
+        return
+
+    requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": from_email,
+            "to": [to_email],
+            "subject": "Your AI Mail Genie Pro License",
+            "html": f"""
+                <h2>Welcome to AI Mail Genie Pro</h2>
+                <p>Your license key:</p>
+                <pre style="font-size:16px;font-weight:bold;">{license_key}</pre>
+                <p>
+                  Open Gmail → AI Mail Genie → Settings → Paste your license key.
+                </p>
+                <p>If you need help, reply to this email.</p>
+            """,
+        },
+        timeout=10,
+    )
 
 def require_openai_api_key():
     k = os.environ.get("OPENAI_API_KEY", "")
