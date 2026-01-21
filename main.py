@@ -24,7 +24,7 @@ PlanMode = Literal["free", "pro"]
 # -----------------------------
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-app = FastAPI(title="AI Mail Genie AI API", version="3.3.0")
+app = FastAPI(title="AI Mail Genie AI API", version="3.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,35 +41,59 @@ app.add_middleware(
 DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
 DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
-def send_license_email(to_email: str, license_key: str):
-    api_key = os.environ.get("RESEND_API_KEY")
-    from_email = os.environ.get("FROM_EMAIL", "license@aiemailgenie.com")
 
-    if not api_key or not to_email:
+# -----------------------------
+# Email delivery (Resend) - best effort
+# -----------------------------
+def send_license_email(to_email: str, license_key: str) -> None:
+    """
+    Best-effort email send. Never raises (so Stripe fulfillment doesn't break).
+    Requires:
+      RESEND_API_KEY
+      FROM_EMAIL (optional)
+    """
+    to_email = (to_email or "").strip().lower()
+    license_key = (license_key or "").strip()
+
+    api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
+    from_email = (os.environ.get("FROM_EMAIL", "license@aiemailgenie.com") or "").strip()
+
+    if not api_key or not to_email or "@" not in to_email or not license_key:
         return
 
-    requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "from": from_email,
-            "to": [to_email],
-            "subject": "Your AI Mail Genie Pro License",
-            "html": f"""
-                <h2>Welcome to AI Mail Genie Pro</h2>
-                <p>Your license key:</p>
-                <pre style="font-size:16px;font-weight:bold;">{license_key}</pre>
-                <p>
-                  Open Gmail → AI Mail Genie → Settings → Paste your license key.
-                </p>
-                <p>If you need help, reply to this email.</p>
-            """,
-        },
-        timeout=10,
-    )
+    try:
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": from_email,
+                "to": [to_email],
+                "subject": "Your AI Mail Genie Pro License",
+                "html": f"""
+                    <div style="font-family: Arial, sans-serif; line-height: 1.4;">
+                      <h2>Welcome to AI Mail Genie Pro</h2>
+                      <p>Your license key:</p>
+                      <div style="padding:12px;border:1px solid #ddd;border-radius:8px;display:inline-block;">
+                        <code style="font-size:16px;font-weight:bold;">{license_key}</code>
+                      </div>
+                      <h3 style="margin-top:18px;">How to activate</h3>
+                      <ol>
+                        <li>Open Gmail</li>
+                        <li>Click <strong>AI Mail Genie</strong> → <strong>Settings</strong></li>
+                        <li>Paste your license key</li>
+                      </ol>
+                      <p>If you need help, reply to this email.</p>
+                    </div>
+                """,
+            },
+            timeout=10,
+        )
+    except Exception:
+        return
+
 
 def require_openai_api_key():
     k = os.environ.get("OPENAI_API_KEY", "")
@@ -144,37 +168,33 @@ def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
     """
     Map Stripe Price ID -> license creation parameters.
     Defaults to lifetime Pro if no mapping is configured.
+    NOTE: Your Worker plan settings currently come from the plans table, so per-license
+          max_devices/daily_limit are effectively ignored. We pass None to avoid confusion.
     """
     pid = (price_id or "").strip()
-
-    # Default settings (your current target: one-time Pro purchase, lifetime)
-    plan = "pro"
-    duration_days = None  # None == lifetime (Worker should treat as no expiry)
-    max_devices = 1
-    daily_limit = 500
 
     if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
         return {
             "plan": "pro",
-            "duration_days": None,
-            "max_devices": 1,
-            "daily_limit": 500,
+            "duration_days": None,   # lifetime
+            "max_devices": None,
+            "daily_limit": None,
         }
 
     if STRIPE_PRICE_PRO_YEARLY and pid == STRIPE_PRICE_PRO_YEARLY:
         return {
             "plan": "pro",
             "duration_days": 365,
-            "max_devices": 1,
-            "daily_limit": 500,
+            "max_devices": None,
+            "daily_limit": None,
         }
 
     # Fallback: treat as Pro lifetime (keeps fulfillment resilient during early setup)
     return {
-        "plan": plan,
-        "duration_days": duration_days,
-        "max_devices": max_devices,
-        "daily_limit": daily_limit,
+        "plan": "pro",
+        "duration_days": None,
+        "max_devices": None,
+        "daily_limit": None,
     }
 
 
@@ -200,7 +220,7 @@ def health_db():
 
 
 # -----------------------------
-# Stripe Webhook (Checkout fulfillment)
+# Stripe Webhook (Checkout fulfillment) - FIXED & COMPLETE
 # -----------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -210,13 +230,11 @@ async def stripe_webhook(request: Request):
 
     Responsibilities:
       - Verify Stripe signature
+      - Retrieve session with expand=['line_items.data.price'] (reliable price IDs)
       - Extract customer email
       - Resolve plan from price_id
       - Call Worker admin endpoint to create license: POST /admin/license/create
-
-    Note:
-      - For Payment Links / Checkout, line items are not always present in the event payload.
-        We retrieve the session with expand=['line_items.data.price'] to get price IDs reliably.
+      - Send license email (best-effort)
     """
     require_stripe_config()
     if not DB_API_URL or not DB_API_KEY:
@@ -226,6 +244,8 @@ async def stripe_webhook(request: Request):
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing Stripe signature header")
 
     try:
         event = stripe.Webhook.construct_event(
@@ -243,12 +263,11 @@ async def stripe_webhook(request: Request):
         return {"ok": True, "ignored": True, "type": event_type}
 
     session = (event.get("data") or {}).get("object") or {}
-    session_id = session.get("id", "")
-
+    session_id = (session.get("id") or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session id")
 
-    # Retrieve full session with line items expanded to obtain price_id
+    # Retrieve full session with line items expanded to obtain price_id reliably
     try:
         full_session = stripe.checkout.Session.retrieve(
             session_id,
@@ -257,37 +276,41 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Stripe retrieve failed: {str(e)}")
 
-    # Email extraction (Stripe can provide customer_details.email or customer_email)
+    # Email extraction
     email = ""
     try:
         cd = getattr(full_session, "customer_details", None) or {}
-        email = (cd.get("email") if isinstance(cd, dict) else "") or ""
+        if isinstance(cd, dict):
+            email = cd.get("email") or ""
     except Exception:
         email = ""
 
     if not email:
-        email = getattr(full_session, "customer_email", "") or ""
+        try:
+            email = getattr(full_session, "customer_email", "") or ""
+        except Exception:
+            email = ""
 
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Missing customer email")
 
-    # Get first line item's price id (one-time purchase)
+    # Price ID extraction (StripeObject-safe)
     price_id = ""
     try:
-        line_items = getattr(full_session, "line_items", None)
-        data = (line_items.get("data") if isinstance(line_items, dict) else None) or []
-        if data:
-            price = data[0].get("price") or {}
-            price_id = (price.get("id") or "").strip()
+        li = getattr(full_session, "line_items", None)
+        data = getattr(li, "data", None) if li is not None else None
+        if data and len(data) > 0:
+            item0 = data[0]
+            p = getattr(item0, "price", None)
+            pid = getattr(p, "id", None) if p is not None else None
+            price_id = (pid or "").strip()
     except Exception:
         price_id = ""
 
-    # If price_id is missing, still proceed with fallback plan (keeps fulfillment robust)
     plan_payload = resolve_plan_from_price_id(price_id)
 
-    # Idempotency: you should enforce idempotency in the Worker using session_id if possible.
-    # For now, we pass stripe_session_id so Worker can dedupe if you add it later.
+    # Create license in Worker
     try:
         created = db_post(
             "/admin/license/create",
@@ -306,8 +329,10 @@ async def stripe_webhook(request: Request):
         # Return 500 so Stripe retries; avoids losing a paid customer fulfillment
         raise HTTPException(status_code=500, detail={"license_create_failed": True, "db_error": e.detail})
 
-    # TODO: Send email with license key (Resend/SendGrid/etc.). Keep webhook fast and reliable.
-    # You can implement email sending after confirming license creation works end-to-end.
+    # Send license email (best-effort)
+    license_key = (created.get("license_key") or "").strip()
+    if license_key:
+        send_license_email(email, license_key)
 
     return {"ok": True, "fulfilled": True, "license": created}
 
@@ -654,7 +679,7 @@ class ChatRequest(BaseModel):
     followupCount: Optional[int] = None
     maxFollowups: int = 5
 
-    # NEW: License system inputs (extension will send these)
+    # License system inputs (extension will send these)
     licenseKey: str = Field(default="", max_length=80)
     deviceId: str = Field(default="", max_length=120)
 
@@ -856,7 +881,6 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "noise": noise,
 
         "plan": {
-            # server will override for gating; kept for context/hints only
             "mode": req.mode,
             "strictness": req.strictness,
         },
@@ -883,9 +907,6 @@ def count_followups(history: List[ChatMessage]) -> int:
 def ai_chat(req: ChatRequest):
     require_openai_api_key()
 
-    # -----------------------------
-    # Server-side plan enforcement from license (UPDATED)
-    # -----------------------------
     license_info = license_validate_or_free_fallback(req.licenseKey, req.deviceId)
     mode_from_db = (license_info.get("mode") or "free").lower().strip()
     if mode_from_db not in ("free", "pro"):
@@ -897,7 +918,7 @@ def ai_chat(req: ChatRequest):
     if (req.userMessage and req.userMessage.strip()) and mode == "free":
         return ChatResponse(reply=upgrade_required_reply())
 
-    # Pro follow-up backstop: keep an upper bound to prevent abuse in early builds.
+    # Pro follow-up backstop
     max_followups = int(req.maxFollowups or 20)
     max_followups = 20 if max_followups <= 0 else max_followups
     max_followups = min(max_followups, 100)
@@ -961,7 +982,6 @@ def ai_chat(req: ChatRequest):
             raise ValueError("Empty reply")
 
         # Best-effort usage tracking (won't break user experience)
-        # Only meter Pro usage; include device_id to prevent key sharing.
         if mode == "pro":
             usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
 
