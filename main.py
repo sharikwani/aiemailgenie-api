@@ -45,7 +45,7 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 # -----------------------------
 # Email delivery (Resend) - best effort
 # -----------------------------
-def send_license_email(to_email: str, license_key: str) -> None:
+def send_license_email(to_email: str, license_key: str, plan_label: str = "AI Mail Genie Pro") -> None:
     """
     Best-effort email send. Never raises (so Stripe fulfillment doesn't break).
     Requires:
@@ -54,6 +54,7 @@ def send_license_email(to_email: str, license_key: str) -> None:
     """
     to_email = (to_email or "").strip().lower()
     license_key = (license_key or "").strip()
+    plan_label = (plan_label or "AI Mail Genie Pro").strip()
 
     api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
     from_email = (os.environ.get("FROM_EMAIL", "license@aiemailgenie.com") or "").strip()
@@ -71,10 +72,10 @@ def send_license_email(to_email: str, license_key: str) -> None:
             json={
                 "from": from_email,
                 "to": [to_email],
-                "subject": "Your AI Mail Genie Pro License",
+                "subject": f"Your {plan_label} License",
                 "html": f"""
                     <div style="font-family: Arial, sans-serif; line-height: 1.4;">
-                      <h2>Welcome to AI Mail Genie Pro</h2>
+                      <h2>Welcome to {plan_label}</h2>
                       <p>Your license key:</p>
                       <div style="padding:12px;border:1px solid #ddd;border-radius:8px;display:inline-block;">
                         <code style="font-size:16px;font-weight:bold;">{license_key}</code>
@@ -151,12 +152,10 @@ def db_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 
-# Optional: set these if you want strict mapping from Stripe Price IDs to plans.
-# Example:
-#   STRIPE_PRICE_PRO_LIFETIME=price_123
-#   STRIPE_PRICE_PRO_YEARLY=price_456
-STRIPE_PRICE_PRO_LIFETIME = os.environ.get("STRIPE_PRICE_PRO_LIFETIME", "").strip()
+# Price IDs (NOT product IDs). Add all 3 in Render env vars.
+STRIPE_PRICE_PRO_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "").strip()
 STRIPE_PRICE_PRO_YEARLY = os.environ.get("STRIPE_PRICE_PRO_YEARLY", "").strip()
+STRIPE_PRICE_PRO_LIFETIME = os.environ.get("STRIPE_PRICE_PRO_LIFETIME", "").strip()
 
 
 def require_stripe_config():
@@ -167,34 +166,49 @@ def require_stripe_config():
 def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
     """
     Map Stripe Price ID -> license creation parameters.
-    Defaults to lifetime Pro if no mapping is configured.
-    NOTE: Your Worker plan settings currently come from the plans table, so per-license
-          max_devices/daily_limit are effectively ignored. We pass None to avoid confusion.
+
+    NOTE: Your Worker plan settings come from the plans table.
+          max_devices/daily_limit are ignored per-license, so we pass None.
     """
     pid = (price_id or "").strip()
 
-    if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
+    # Monthly
+    if STRIPE_PRICE_PRO_MONTHLY and pid == STRIPE_PRICE_PRO_MONTHLY:
         return {
             "plan": "pro",
-            "duration_days": None,   # lifetime
+            "duration_days": 30,
             "max_devices": None,
             "daily_limit": None,
+            "label": "AI Mail Genie Pro (Monthly)",
         }
 
+    # Yearly
     if STRIPE_PRICE_PRO_YEARLY and pid == STRIPE_PRICE_PRO_YEARLY:
         return {
             "plan": "pro",
             "duration_days": 365,
             "max_devices": None,
             "daily_limit": None,
+            "label": "AI Mail Genie Pro (Yearly)",
         }
 
-    # Fallback: treat as Pro lifetime (keeps fulfillment resilient during early setup)
+    # Lifetime
+    if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
+        return {
+            "plan": "pro",
+            "duration_days": None,
+            "max_devices": None,
+            "daily_limit": None,
+            "label": "AI Mail Genie Pro (Lifetime)",
+        }
+
+    # Fallback: lifetime pro (keeps fulfillment resilient early)
     return {
         "plan": "pro",
         "duration_days": None,
         "max_devices": None,
         "daily_limit": None,
+        "label": "AI Mail Genie Pro",
     }
 
 
@@ -220,7 +234,7 @@ def health_db():
 
 
 # -----------------------------
-# Stripe Webhook (Checkout fulfillment) - FIXED & COMPLETE
+# Stripe Webhook (Checkout fulfillment)
 # -----------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -254,12 +268,10 @@ async def stripe_webhook(request: Request):
             secret=STRIPE_WEBHOOK_SECRET,
         )
     except Exception:
-        # Stripe expects 4xx on signature failures
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
 
     event_type = event.get("type", "")
     if event_type != "checkout.session.completed":
-        # Acknowledge other events (Stripe will retry if non-2xx)
         return {"ok": True, "ignored": True, "type": event_type}
 
     session = (event.get("data") or {}).get("object") or {}
@@ -310,7 +322,7 @@ async def stripe_webhook(request: Request):
 
     plan_payload = resolve_plan_from_price_id(price_id)
 
-    # Create license in Worker
+    # Create license in Worker (Worker handles dedupe by stripe_session_id)
     try:
         created = db_post(
             "/admin/license/create",
@@ -326,13 +338,12 @@ async def stripe_webhook(request: Request):
             timeout=20,
         )
     except HTTPException as e:
-        # Return 500 so Stripe retries; avoids losing a paid customer fulfillment
         raise HTTPException(status_code=500, detail={"license_create_failed": True, "db_error": e.detail})
 
     # Send license email (best-effort)
     license_key = (created.get("license_key") or "").strip()
     if license_key:
-        send_license_email(email, license_key)
+        send_license_email(email, license_key, plan_label=plan_payload.get("label") or "AI Mail Genie Pro")
 
     return {"ok": True, "fulfilled": True, "license": created}
 
@@ -612,7 +623,6 @@ def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[
         return {"ok": True, "mode": "free"}
 
     except HTTPException as e:
-        # If endpoint missing or errors, fail safe to free (no crashes)
         if e.status_code == 404:
             return {"ok": True, "mode": "free"}
         return {"ok": True, "mode": "free"}
@@ -912,9 +922,9 @@ def ai_chat(req: ChatRequest):
     if mode_from_db not in ("free", "pro"):
         mode_from_db = "free"
 
-    mode = mode_from_db  # override client hint with server truth
+    mode = mode_from_db
 
-    # Follow-ups are Pro-only. Free users get the initial analysis only.
+    # Follow-ups are Pro-only.
     if (req.userMessage and req.userMessage.strip()) and mode == "free":
         return ChatResponse(reply=upgrade_required_reply())
 
@@ -981,7 +991,7 @@ def ai_chat(req: ChatRequest):
         if not reply:
             raise ValueError("Empty reply")
 
-        # Best-effort usage tracking (won't break user experience)
+        # Best-effort usage tracking
         if mode == "pro":
             usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
 
