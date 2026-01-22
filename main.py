@@ -45,7 +45,12 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 # -----------------------------
 # Email delivery (Resend) - best effort
 # -----------------------------
-def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro", session_id: str = "") -> None:
+def send_license_email(
+    to_email: str,
+    license_key: str,
+    plan_name: str = "Pro",
+    session_id: str = "",
+) -> None:
     """
     Sends a premium, branded license email via Resend.
     Best-effort only — never raises.
@@ -60,11 +65,17 @@ def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro", 
     if not api_key or not to_email or "@" not in to_email or not license_key:
         return
 
+    # Build Manage License URL (includes session_id if present)
+    sid = (session_id or "").strip()
+    manage_url = (
+        f"https://aiemailgenie.com/manage.html?session_id={requests.utils.quote(sid)}"
+        if sid
+        else "https://aiemailgenie.com/manage.html"
+    )
+
     subject = f"Welcome to AI Mail Genie {plan_name} ✨ Your License Is Ready"
 
     html = f"""
-        sid = (session_id or "").strip()
-    manage_url = f"https://aiemailgenie.com/manage.html?session_id={sid}" if sid else "https://aiemailgenie.com/manage.html"
     <html>
       <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
         <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
@@ -104,7 +115,8 @@ def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro", 
                         {license_key}
                       </div>
                     </div>
-                                        <!-- MANAGE LICENSE BUTTON -->
+
+                    <!-- MANAGE LICENSE BUTTON -->
                     <div style="margin: 18px 0 8px 0;">
                       <a href="{manage_url}"
                          style="display:inline-block;padding:12px 16px;border-radius:12px;
@@ -304,7 +316,7 @@ def health_db():
 
 
 # -----------------------------
-# NEW: Manage License lookup
+# Manage License lookup
 # GET /api/manage/lookup?session_id=cs_...
 # -----------------------------
 @app.get("/api/manage/lookup")
@@ -318,14 +330,14 @@ def manage_license_lookup(session_id: str):
     if not session_id:
         raise HTTPException(status_code=400, detail="missing_session_id")
 
-    # Worker/DB gateway must be configured
     require_db_api_config()
 
-    # Call Worker
-    data = db_get(f"/admin/license/by-session?session_id={session_id}", timeout=15)
+    # IMPORTANT:
+    # This must match what your Worker expects.
+    # Your current system is working with "session_id", so we keep that here.
+    sid_q = requests.utils.quote(session_id)
+    data = db_get(f"/admin/license/by-session?session_id={sid_q}", timeout=15)
 
-    # Expected Worker response:
-    # { ok: true, license_key: "...", plan: "...", expires_at: "..." }
     license_key = (data.get("license_key") or "").strip()
     plan = data.get("plan")
     expires_at = data.get("expires_at")
@@ -334,11 +346,9 @@ def manage_license_lookup(session_id: str):
     if len(license_key) > 8:
         masked = f"{license_key[:4]}…{license_key[-4:]}"
 
-    # Compute a simple status for UI
     status = "active"
     try:
         if expires_at:
-            # Worker stores ISO timestamp; compare to now
             from datetime import datetime, timezone
             exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
             if exp < datetime.now(timezone.utc):
@@ -400,7 +410,6 @@ async def stripe_webhook(request: Request):
     if not session_id:
         raise HTTPException(status_code=400, detail="Missing session id")
 
-    # Retrieve full session with line items expanded to obtain price_id reliably
     try:
         full_session = stripe.checkout.Session.retrieve(
             session_id,
@@ -461,11 +470,15 @@ async def stripe_webhook(request: Request):
     except HTTPException as e:
         raise HTTPException(status_code=500, detail={"license_create_failed": True, "db_error": e.detail})
 
-    # Send license email (best-effort)
+    # Send license email (best-effort) — includes Manage License link with session_id
     license_key = (created.get("license_key") or "").strip()
     if license_key:
-        # FIXED: parameter name is plan_name (not plan_label)
-        send_license_email(email, license_key, plan_name=plan_payload.get("label") or "AI Mail Genie Pro")
+        send_license_email(
+            email,
+            license_key,
+            plan_name=plan_payload.get("label") or "AI Mail Genie Pro",
+            session_id=session_id,
+        )
 
     return {"ok": True, "fulfilled": True, "license": created}
 
