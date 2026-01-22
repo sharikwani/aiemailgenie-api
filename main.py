@@ -1,7 +1,7 @@
 import os
 import re
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
-from urllib.parse import quote
 
 import requests
 import stripe
@@ -44,146 +44,31 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
 
 # -----------------------------
-# Stripe config
-# -----------------------------
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
-
-# Price IDs (NOT product IDs). Add all 3 in Render env vars.
-STRIPE_PRICE_PRO_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "").strip()
-STRIPE_PRICE_PRO_YEARLY = os.environ.get("STRIPE_PRICE_PRO_YEARLY", "").strip()
-STRIPE_PRICE_PRO_LIFETIME = os.environ.get("STRIPE_PRICE_PRO_LIFETIME", "").strip()
-
-# Stripe Billing Portal return URL (where user goes back after managing billing)
-BILLING_PORTAL_RETURN_URL = os.environ.get("BILLING_PORTAL_RETURN_URL", "https://aiemailgenie.com/manage.html").strip()
-
-# -----------------------------
-# CRON secret (Option A: Render Cron hits Render endpoint)
+# Security for cron endpoint
 # -----------------------------
 CRON_SECRET = (os.environ.get("CRON_SECRET", "") or "").strip()
+
+
+def require_cron_secret(request: Request) -> None:
+    expected = CRON_SECRET
+    got = (request.headers.get("X-CRON-SECRET", "") or "").strip()
+    if not expected or got != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 
 # -----------------------------
 # Email delivery (Resend) - best effort
 # -----------------------------
-def send_license_email(
-    to_email: str,
-    license_key: str,
-    plan_name: str = "Pro",
-    session_id: str = "",
-) -> None:
+def send_resend_email(to_email: str, subject: str, html: str) -> None:
     """
-    Sends a premium, branded license email via Resend.
     Best-effort only — never raises.
-
-    NOTE:
-      - We link user to manage.html (no long query string).
-      - We also link to success.html with session_id (so it can store into localStorage).
     """
-    to_email = (to_email or "").strip().lower()
-    license_key = (license_key or "").strip()
-    session_id = (session_id or "").strip()
-
     api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
     from_email = (os.environ.get("FROM_EMAIL", "AI Mail Genie <license@aiemailgenie.com>")).strip()
 
-    if not api_key or not to_email or "@" not in to_email or not license_key:
+    to_email = (to_email or "").strip().lower()
+    if not api_key or not to_email or "@" not in to_email:
         return
-
-    subject = f"Welcome to AI Mail Genie {plan_name} — Your License Is Ready"
-
-    manage_url = "https://aiemailgenie.com/manage.html"
-    success_url = "https://aiemailgenie.com/success.html"
-    if session_id:
-        success_url = f"https://aiemailgenie.com/success.html?session_id={quote(session_id)}"
-
-    html = f"""
-    <html>
-      <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
-          <tr>
-            <td align="center">
-              <table width="600" cellpadding="0" cellspacing="0" style="background:#111827;border-radius:16px;overflow:hidden;box-shadow:0 0 40px rgba(0,255,200,0.08);">
-
-                <!-- HEADER -->
-                <tr>
-                  <td style="padding:32px;text-align:center;background:linear-gradient(135deg,#0ea5e9,#22c55e);">
-                    <img src="https://aiemailgenie.com/logo.png" alt="AI Mail Genie" width="64" style="margin-bottom:12px;" />
-                    <h1 style="margin:0;font-size:26px;font-weight:800;color:#041014;">
-                      Welcome to AI Mail Genie {plan_name}
-                    </h1>
-                  </td>
-                </tr>
-
-                <!-- BODY -->
-                <tr>
-                  <td style="padding:32px;">
-                    <p style="font-size:16px;line-height:1.6;margin-top:0;">
-                      Thank you for choosing <strong>AI Mail Genie</strong>. Your purchase was successful and your license is active.
-                    </p>
-
-                    <p style="font-size:15px;color:#cbd5e1;">
-                      <strong>Account email:</strong> {to_email}<br/>
-                      <strong>Plan:</strong> {plan_name}
-                    </p>
-
-                    <!-- LICENSE BOX -->
-                    <div style="margin:28px 0;padding:20px;border-radius:12px;background:#020617;border:1px solid #1f2937;">
-                      <p style="margin:0 0 8px 0;color:#94a3b8;font-size:14px;">Your license key</p>
-                      <div style="font-size:18px;font-weight:900;letter-spacing:1px;color:#22c55e;">
-                        {license_key}
-                      </div>
-                    </div>
-
-                    <!-- ACTION BUTTONS -->
-                    <div style="margin: 18px 0 8px 0;">
-                      <a href="{success_url}"
-                         style="display:inline-block;padding:12px 16px;border-radius:12px;
-                                background:linear-gradient(135deg,#0ea5e9,#22c55e);
-                                color:#041014;font-weight:900;text-decoration:none;margin-right:10px;">
-                        Open Success Page
-                      </a>
-
-                      <a href="{manage_url}"
-                         style="display:inline-block;padding:12px 16px;border-radius:12px;
-                                border:1px solid #1f2937;background:#0b1220;color:#e5e7eb;
-                                font-weight:800;text-decoration:none;">
-                        Manage License
-                      </a>
-                    </div>
-
-                    <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
-                      Tip: Open the Success Page once after checkout. It securely stores your purchase in your browser so Manage License works without long links.
-                    </p>
-
-                    <!-- HOW TO ACTIVATE -->
-                    <h3 style="margin:22px 0 10px 0;">How to activate</h3>
-                    <ol style="padding-left:20px;color:#e5e7eb;font-size:15px;line-height:1.6;margin-top:0;">
-                      <li>Open Gmail</li>
-                      <li>Click <strong>AI Mail Genie → Settings</strong></li>
-                      <li>Paste your license key</li>
-                    </ol>
-
-                    <p style="margin-top:24px;font-size:14px;color:#9ca3af;">
-                      If you need help, reply to this email.
-                    </p>
-                  </td>
-                </tr>
-
-                <!-- FOOTER -->
-                <tr>
-                  <td style="padding:20px;text-align:center;font-size:12px;color:#64748b;background:#020617;">
-                    © 2026 AI Mail Genie · Security-first email intelligence
-                  </td>
-                </tr>
-
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-    </html>
-    """
 
     try:
         requests.post(
@@ -204,8 +89,106 @@ def send_license_email(
         return
 
 
+def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro", session_id: str = "") -> None:
+    """
+    Sends a premium, branded license email via Resend.
+    Best-effort only — never raises.
+    Includes a Manage License link (no long query string required; success.html stores session_id in localStorage).
+    """
+    to_email = (to_email or "").strip().lower()
+    license_key = (license_key or "").strip()
+
+    api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
+    if not api_key or not to_email or "@" not in to_email or not license_key:
+        return
+
+    # Prefer no query string on static host (reduces 403 issues). Your manage.html reads localStorage.
+    manage_url = "https://aiemailgenie.com/manage.html"
+
+    subject = f"Welcome to AI Mail Genie {plan_name} — Your License Is Ready"
+
+    html = f"""
+    <html>
+      <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
+          <tr>
+            <td align="center">
+              <table width="600" cellpadding="0" cellspacing="0" style="background:#111827;border-radius:16px;overflow:hidden;box-shadow:0 0 40px rgba(0,255,200,0.08);">
+
+                <tr>
+                  <td style="padding:32px;text-align:center;background:linear-gradient(135deg,#0ea5e9,#22c55e);">
+                    <img src="https://aiemailgenie.com/logo.png" alt="AI Mail Genie" width="64" style="margin-bottom:12px;" />
+                    <h1 style="margin:0;font-size:26px;font-weight:800;color:#041014;">
+                      Welcome to AI Mail Genie {plan_name}
+                    </h1>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:32px;">
+                    <p style="font-size:16px;line-height:1.6;margin-top:0;">
+                      Thank you for choosing <strong>AI Mail Genie</strong>.
+                      Your purchase was successful, and your license is now active.
+                    </p>
+
+                    <p style="font-size:15px;color:#cbd5e1;">
+                      <strong>Account email:</strong> {to_email}<br/>
+                      <strong>Plan:</strong> {plan_name}
+                    </p>
+
+                    <div style="margin:28px 0;padding:20px;border-radius:12px;background:#020617;border:1px solid #1f2937;">
+                      <p style="margin:0 0 8px 0;color:#94a3b8;font-size:14px;">
+                        Your license key
+                      </p>
+                      <div style="font-size:18px;font-weight:800;letter-spacing:1px;color:#22c55e;">
+                        {license_key}
+                      </div>
+                    </div>
+
+                    <div style="margin: 18px 0 8px 0;">
+                      <a href="{manage_url}"
+                         style="display:inline-block;padding:12px 16px;border-radius:12px;
+                                background:linear-gradient(135deg,#0ea5e9,#22c55e);
+                                color:#041014;font-weight:900;text-decoration:none;">
+                        Manage License
+                      </a>
+                    </div>
+                    <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
+                      Use this to view your plan, expiry, and manage billing anytime.
+                    </p>
+
+                    <h3 style="margin:22px 0 10px 0;">How to activate</h3>
+                    <ol style="padding-left:20px;color:#e5e7eb;font-size:15px;line-height:1.6;margin:0;">
+                      <li>Open Gmail</li>
+                      <li>Click <strong>AI Mail Genie → Settings</strong></li>
+                      <li>Paste your license key</li>
+                    </ol>
+
+                    <p style="margin-top:22px;font-size:14px;color:#9ca3af;">
+                      If you need help, reply to this email.
+                    </p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:20px;text-align:center;font-size:12px;color:#64748b;background:#020617;">
+                    © 2026 AI Mail Genie
+                  </td>
+                </tr>
+
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
+
+    send_resend_email(to_email, subject, html)
+
+
 # -----------------------------
-# Basic config guards
+# Guards / helpers
 # -----------------------------
 def require_openai_api_key():
     k = os.environ.get("OPENAI_API_KEY", "")
@@ -218,21 +201,6 @@ def require_db_api_config():
         raise HTTPException(status_code=500, detail="DB_API_URL / DB_API_KEY not configured")
 
 
-def require_stripe_config():
-    if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET not configured")
-
-
-def require_cron_secret(request: Request):
-    expected = CRON_SECRET
-    got = (request.headers.get("X-CRON-SECRET", "") or "").strip()
-    if not expected or got != expected:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-
-# -----------------------------
-# Worker DB gateway helpers
-# -----------------------------
 def db_get(path: str, timeout: int = 15) -> Dict[str, Any]:
     require_db_api_config()
     url = f"{DB_API_URL}{path}"
@@ -273,8 +241,22 @@ def db_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, 
 
 
 # -----------------------------
-# Stripe helpers
+# Stripe config
 # -----------------------------
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
+
+# Price IDs (NOT product IDs). Add all 3 in Render env vars.
+STRIPE_PRICE_PRO_MONTHLY = os.environ.get("STRIPE_PRICE_PRO_MONTHLY", "").strip()
+STRIPE_PRICE_PRO_YEARLY = os.environ.get("STRIPE_PRICE_PRO_YEARLY", "").strip()
+STRIPE_PRICE_PRO_LIFETIME = os.environ.get("STRIPE_PRICE_PRO_LIFETIME", "").strip()
+
+
+def require_stripe_config():
+    if not STRIPE_SECRET_KEY or not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET not configured")
+
+
 def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
     """
     Map Stripe Price ID -> license creation parameters.
@@ -290,7 +272,6 @@ def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
     if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
         return {"plan": "pro", "duration_days": None, "label": "AI Mail Genie Pro (Lifetime)"}
 
-    # Fallback: lifetime pro
     return {"plan": "pro", "duration_days": None, "label": "AI Mail Genie Pro"}
 
 
@@ -306,6 +287,7 @@ def health():
 def health_db():
     if not DB_API_URL or not DB_API_KEY:
         return {"ok": True, "db": "not_configured"}
+
     try:
         data = db_get("/health/db", timeout=15)
         return {"ok": True, "db": data}
@@ -314,23 +296,19 @@ def health_db():
 
 
 # -----------------------------
-# Manage License lookup (Render -> Worker)
+# Manage License lookup (used by manage.html)
 # GET /api/manage/lookup?session_id=cs_...
 # -----------------------------
 @app.get("/api/manage/lookup")
 def manage_license_lookup(session_id: str):
-    """
-    Browser calls this endpoint (Render).
-    Backend calls Worker admin endpoint /admin/license/by-session (Cloudflare).
-    Returns SAFE fields only (masked license key).
-    """
     session_id = (session_id or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="missing_session_id")
 
     require_db_api_config()
 
-    data = db_get(f"/admin/license/by-session?session_id={quote(session_id)}", timeout=20)
+    # Worker endpoint accepts session_id (and stripe_session_id as fallback)
+    data = db_get(f"/admin/license/by-session?session_id={requests.utils.quote(session_id)}", timeout=20)
 
     license_key = (data.get("license_key") or "").strip()
     plan = data.get("plan")
@@ -343,7 +321,6 @@ def manage_license_lookup(session_id: str):
     status = "active"
     try:
         if expires_at:
-            from datetime import datetime, timezone
             exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
             if exp < datetime.now(timezone.utc):
                 status = "expired"
@@ -359,205 +336,50 @@ def manage_license_lookup(session_id: str):
 
 
 # -----------------------------
-# Stripe: Billing Portal (Customer Portal)
+# Stripe customer portal endpoint
 # POST /api/billing/portal
-# Body: { session_id: "cs_..." }
-# Returns: { url: "https://billing.stripe.com/..." }
+# Body: { "session_id": "cs_..." }
+# Returns: { "url": "https://billing.stripe.com/..." }
 # -----------------------------
-class BillingPortalRequest(BaseModel):
+class PortalRequest(BaseModel):
     session_id: str = Field(default="", max_length=200)
 
 
 @app.post("/api/billing/portal")
-def create_billing_portal(req: BillingPortalRequest):
-    """
-    Creates a Stripe Billing Portal session from a Checkout session_id.
-    Used by manage.html 'Manage Billing' button.
-    """
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
-
+def create_billing_portal(req: PortalRequest):
+    require_stripe_config()
     stripe.api_key = STRIPE_SECRET_KEY
 
-    session_id = (req.session_id or "").strip()
-    if not session_id:
+    sid = (req.session_id or "").strip()
+    if not sid:
         raise HTTPException(status_code=400, detail="missing_session_id")
 
+    # Get checkout session -> customer id
     try:
-        checkout = stripe.checkout.Session.retrieve(session_id)
+        s = stripe.checkout.Session.retrieve(sid)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"stripe_retrieve_failed: {str(e)}")
 
-    customer = getattr(checkout, "customer", None)
-    if not customer:
+    customer_id = getattr(s, "customer", None)
+    if not customer_id:
         raise HTTPException(status_code=400, detail="no_customer_on_session")
+
+    # Return user back to manage page
+    return_url = "https://aiemailgenie.com/manage.html"
 
     try:
         portal = stripe.billing_portal.Session.create(
-            customer=customer,
-            return_url=BILLING_PORTAL_RETURN_URL,
+            customer=customer_id,
+            return_url=return_url,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"stripe_portal_failed: {str(e)}")
 
-    return {"url": getattr(portal, "url", "")}
+    url = (getattr(portal, "url", "") or "").strip()
+    if not url:
+        raise HTTPException(status_code=502, detail="stripe_portal_missing_url")
 
-
-# -----------------------------
-# CRON: License reminders (Option A)
-# POST /cron/license-reminders/run
-# Header: X-CRON-SECRET: <CRON_SECRET>
-# -----------------------------
-def send_resend_email(to_email: str, subject: str, html: str) -> None:
-    api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
-    from_email = (os.environ.get("FROM_EMAIL", "AI Mail Genie <license@aiemailgenie.com>") or "").strip()
-
-    to_email = (to_email or "").strip().lower()
-    if not api_key or not to_email or "@" not in to_email:
-        return
-
-    try:
-        requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"from": from_email, "to": [to_email], "subject": subject, "html": html},
-            timeout=12,
-        )
-    except Exception:
-        return
-
-
-def reminder_email_html(kind: str, plan_name: str, expires_at: str) -> str:
-    title = "Your AI Mail Genie license is expiring soon"
-    pre = "Your subscription is ending soon."
-    if kind == "1d":
-        title = "Your AI Mail Genie license expires tomorrow"
-        pre = "Your subscription expires tomorrow."
-    if kind == "expired":
-        title = "Your AI Mail Genie license has expired"
-        pre = "Your subscription has expired."
-
-    exp_line = ""
-    if expires_at:
-        exp_line = f"<p style='margin:0 0 12px 0;color:#cbd5e1;'><strong>Expiry:</strong> {expires_at}</p>"
-
-    manage_url = "https://aiemailgenie.com/manage.html"
-
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
-          <tr>
-            <td align="center">
-              <table width="600" cellpadding="0" cellspacing="0" style="background:#111827;border-radius:16px;overflow:hidden;box-shadow:0 0 40px rgba(0,255,200,0.08);">
-                <tr>
-                  <td style="padding:28px;text-align:center;background:linear-gradient(135deg,#0ea5e9,#22c55e);">
-                    <img src="https://aiemailgenie.com/logo.png" alt="AI Mail Genie" width="56" style="margin-bottom:10px;" />
-                    <h1 style="margin:0;font-size:22px;font-weight:900;color:#041014;">{title}</h1>
-                  </td>
-                </tr>
-
-                <tr>
-                  <td style="padding:28px;">
-                    <p style="margin:0 0 12px 0;line-height:1.6;color:#e5e7eb;">
-                      {pre} Manage billing to keep your <strong>{plan_name or "Pro"}</strong> plan active.
-                    </p>
-                    {exp_line}
-
-                    <div style="margin:18px 0 8px 0;">
-                      <a href="{manage_url}"
-                         style="display:inline-block;padding:12px 16px;border-radius:12px;
-                                background:linear-gradient(135deg,#0ea5e9,#22c55e);
-                                color:#041014;font-weight:900;text-decoration:none;">
-                        Manage Billing
-                      </a>
-                    </div>
-
-                    <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
-                      If the button does not work, open Manage License and click “Manage Billing”.
-                    </p>
-                  </td>
-                </tr>
-
-                <tr>
-                  <td style="padding:18px;text-align:center;font-size:12px;color:#64748b;background:#020617;">
-                    © 2026 AI Mail Genie
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-    </html>
-    """
-
-
-@app.post("/cron/license-reminders/run")
-def cron_license_reminders_run(request: Request):
-    """
-    Render Cron calls this endpoint daily.
-    - Pull lists from Worker:
-        GET /admin/licenses/expiring?days=7
-        GET /admin/licenses/expiring?days=1
-        GET /admin/licenses/expiring?days=0   (expired)
-    - Send emails via Resend (Render env)
-    - Mark as sent:
-        POST /admin/licenses/mark-reminded  { kind, license_ids }
-    """
-    require_cron_secret(request)
-    require_db_api_config()
-
-    batches = [
-        {"days": 7, "kind": "7d"},
-        {"days": 1, "kind": "1d"},
-        {"days": 0, "kind": "expired"},
-    ]
-
-    out = {
-        "ok": True,
-        "sent": {"7d": 0, "1d": 0, "expired": 0},
-        "skipped_missing_email": 0,
-    }
-
-    for b in batches:
-        days = b["days"]
-        kind = b["kind"]
-
-        data = db_get(f"/admin/licenses/expiring?days={days}", timeout=30)
-        licenses = (data.get("licenses") or []) if isinstance(data, dict) else []
-
-        sent_ids: List[int] = []
-
-        for row in licenses[:500]:
-            lic_id = row.get("id")
-            email = (row.get("email") or "").strip().lower()
-            plan = row.get("plan_name") or row.get("plan") or "Pro"
-            expires_at = row.get("expires_at") or ""
-
-            if not email or "@" not in email:
-                out["skipped_missing_email"] += 1
-                continue
-
-            subject = "AI Mail Genie — renewal reminder"
-            if kind == "1d":
-                subject = "AI Mail Genie — expires tomorrow"
-            if kind == "expired":
-                subject = "AI Mail Genie — expired"
-
-            html = reminder_email_html(kind=kind, plan_name=str(plan), expires_at=str(expires_at))
-            send_resend_email(email, subject, html)
-
-            try:
-                sent_ids.append(int(lic_id))
-            except Exception:
-                continue
-
-        if sent_ids:
-            db_post("/admin/licenses/mark-reminded", {"kind": kind, "license_ids": sent_ids}, timeout=30)
-            out["sent"][kind] += len(sent_ids)
-
-    return out
+    return {"ok": True, "url": url}
 
 
 # -----------------------------
@@ -565,18 +387,6 @@ def cron_license_reminders_run(request: Request):
 # -----------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    """
-    Receives Stripe events.
-    Primary event: checkout.session.completed
-
-    Responsibilities:
-      - Verify Stripe signature
-      - Retrieve session with expand=['line_items.data.price'] (reliable price IDs)
-      - Extract customer email
-      - Resolve plan from price_id
-      - Call Worker admin endpoint to create license: POST /admin/license/create
-      - Send license email (best-effort)
-    """
     require_stripe_config()
     require_db_api_config()
 
@@ -633,7 +443,7 @@ async def stripe_webhook(request: Request):
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Missing customer email")
 
-    # Price ID extraction (StripeObject-safe)
+    # Price ID extraction
     price_id = ""
     try:
         li = getattr(full_session, "line_items", None)
@@ -648,7 +458,7 @@ async def stripe_webhook(request: Request):
 
     plan_payload = resolve_plan_from_price_id(price_id)
 
-    # Create license in Worker (Worker dedupes by stripe_session_id)
+    # Create license in Worker (Worker handles dedupe by stripe_session_id)
     try:
         created = db_post(
             "/admin/license/create",
@@ -675,6 +485,136 @@ async def stripe_webhook(request: Request):
         )
 
     return {"ok": True, "fulfilled": True, "license": created}
+
+
+# -----------------------------
+# CRON: License renewal reminders (Option A)
+# POST /cron/license-reminders/run
+# Header: X-CRON-SECRET: <CRON_SECRET>
+# -----------------------------
+def reminder_email_html(kind: str, plan_name: str, expires_at: str, manage_url: str) -> str:
+    title = "Your AI Mail Genie license is expiring soon"
+    pre = "Your subscription is ending soon."
+    if kind == "1d":
+        title = "Your AI Mail Genie license expires tomorrow"
+        pre = "Your subscription expires tomorrow."
+    if kind == "expired":
+        title = "Your AI Mail Genie license has expired"
+        pre = "Your subscription has expired."
+
+    exp_line = ""
+    if expires_at:
+        exp_line = f"<p style='margin:0 0 12px 0;color:#cbd5e1;'><strong>Expiry:</strong> {expires_at}</p>"
+
+    return f"""
+    <html>
+      <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
+          <tr>
+            <td align="center">
+              <table width="600" cellpadding="0" cellspacing="0" style="background:#111827;border-radius:16px;overflow:hidden;box-shadow:0 0 40px rgba(0,255,200,0.08);">
+                <tr>
+                  <td style="padding:28px;text-align:center;background:linear-gradient(135deg,#0ea5e9,#22c55e);">
+                    <img src="https://aiemailgenie.com/logo.png" alt="AI Mail Genie" width="56" style="margin-bottom:10px;" />
+                    <h1 style="margin:0;font-size:22px;font-weight:900;color:#041014;">{title}</h1>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:28px;">
+                    <p style="margin:0 0 12px 0;line-height:1.6;color:#e5e7eb;">
+                      {pre}
+                      Use the button below to manage billing and keep your <strong>{plan_name or "Pro"}</strong> plan active.
+                    </p>
+                    {exp_line}
+
+                    <div style="margin:18px 0 8px 0;">
+                      <a href="{manage_url}"
+                         style="display:inline-block;padding:12px 16px;border-radius:12px;
+                                background:linear-gradient(135deg,#0ea5e9,#22c55e);
+                                color:#041014;font-weight:900;text-decoration:none;">
+                        Manage Billing
+                      </a>
+                    </div>
+
+                    <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
+                      If the button does not work, open your Manage page and click “Manage Billing”.
+                    </p>
+                  </td>
+                </tr>
+
+                <tr>
+                  <td style="padding:18px;text-align:center;font-size:12px;color:#64748b;background:#020617;">
+                    © 2026 AI Mail Genie
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
+
+
+@app.post("/cron/license-reminders/run")
+def cron_license_reminders_run(request: Request):
+    require_cron_secret(request)
+    require_db_api_config()
+
+    # Always send to the manage page (no long query string)
+    manage_url = "https://aiemailgenie.com/manage.html"
+
+    batches = [
+        {"days": 7, "kind": "7d"},
+        {"days": 1, "kind": "1d"},
+        {"days": 0, "kind": "expired"},
+    ]
+
+    out = {"ok": True, "sent": {"7d": 0, "1d": 0, "expired": 0}, "skipped_missing_email": 0}
+
+    for b in batches:
+        days = b["days"]
+        kind = b["kind"]
+
+        data = db_get(f"/admin/licenses/expiring?days={days}", timeout=30)
+        licenses = (data.get("licenses") or []) if isinstance(data, dict) else []
+
+        sent_ids: List[int] = []
+
+        for row in licenses[:500]:
+            lic_id = row.get("id")
+            email = (row.get("email") or "").strip().lower()
+            plan = row.get("plan_name") or row.get("plan") or "Pro"
+            expires_at = row.get("expires_at") or ""
+
+            if not email or "@" not in email:
+                out["skipped_missing_email"] += 1
+                continue
+
+            subject = "AI Mail Genie — renewal reminder"
+            if kind == "1d":
+                subject = "AI Mail Genie — expires tomorrow"
+            if kind == "expired":
+                subject = "AI Mail Genie — expired"
+
+            html = reminder_email_html(kind=kind if kind != "7d" else "7d", plan_name=str(plan), expires_at=str(expires_at), manage_url=manage_url)
+            send_resend_email(email, subject, html)
+
+            if isinstance(lic_id, int):
+                sent_ids.append(lic_id)
+            elif isinstance(lic_id, str) and lic_id.isdigit():
+                sent_ids.append(int(lic_id))
+
+        if sent_ids:
+            db_post(
+                "/admin/licenses/mark-reminded",
+                {"kind": kind, "license_ids": sent_ids},
+                timeout=30,
+            )
+            out["sent"][kind] += len(sent_ids)
+
+    return out
 
 
 # -----------------------------
@@ -908,7 +848,7 @@ def decide_verdict(
 
 
 # -----------------------------
-# License gate (uses Worker) - UPDATED
+# License gate (uses Worker)
 # -----------------------------
 def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
     license_key = (license_key or "").strip()
@@ -926,12 +866,7 @@ def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[
         if isinstance(data, dict) and "valid" in data:
             if data.get("valid") is True:
                 plan = data.get("plan") or {}
-                return {
-                    "ok": True,
-                    "mode": "pro",
-                    "license_id": data.get("license_id"),
-                    "plan": plan,
-                }
+                return {"ok": True, "mode": "pro", "license_id": data.get("license_id"), "plan": plan}
             return {"ok": True, "mode": "free", "reason": data.get("reason", "invalid")}
 
         if isinstance(data, dict) and data.get("ok") is True:
@@ -952,11 +887,7 @@ def usage_increment_best_effort(license_key: str, device_id: str, amount: int = 
         return
 
     try:
-        db_post(
-            "/usage/increment",
-            {"license_key": license_key, "device_id": device_id, "amount": int(amount)},
-            timeout=12,
-        )
+        db_post("/usage/increment", {"license_key": license_key, "device_id": device_id, "amount": int(amount)}, timeout=12)
     except Exception:
         return
 
@@ -1196,10 +1127,7 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
         "noise": noise,
 
-        "plan": {
-            "mode": req.mode,
-            "strictness": req.strictness,
-        },
+        "plan": {"mode": req.mode, "strictness": req.strictness},
 
         "computed_link_signals": link_signals,
 
@@ -1213,4 +1141,88 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
 
 def count_followups(history: List[ChatMessage]) -> int:
-    return sum(1 for h in (history or []) if h.role
+    return sum(1 for h in (history or []) if h.role == "user")
+
+
+# -----------------------------
+# Core endpoint
+# -----------------------------
+@app.post("/ai/chat", response_model=ChatResponse)
+def ai_chat(req: ChatRequest):
+    require_openai_api_key()
+
+    license_info = license_validate_or_free_fallback(req.licenseKey, req.deviceId)
+    mode_from_db = (license_info.get("mode") or "free").lower().strip()
+    if mode_from_db not in ("free", "pro"):
+        mode_from_db = "free"
+
+    mode = mode_from_db
+
+    # Follow-ups are Pro-only.
+    if (req.userMessage and req.userMessage.strip()) and mode == "free":
+        return ChatResponse(reply=upgrade_required_reply())
+
+    max_followups = int(req.maxFollowups or 20)
+    max_followups = 20 if max_followups <= 0 else max_followups
+    max_followups = min(max_followups, 100)
+
+    followups_used = req.followupCount
+    if followups_used is None:
+        followups_used = count_followups(req.history)
+
+    if req.userMessage and req.userMessage.strip() and followups_used >= max_followups:
+        return ChatResponse(
+            reply=(
+                "VERDICT: CAUTION\n"
+                "CONFIDENCE: 0.50\n\n"
+                "WHY (SHORT)\n"
+                "Follow-up limit reached for this email thread.\n\n"
+                "WHAT I CHECKED\n"
+                "- Sender address & domain\n"
+                "- Mailed-by / Signed-by (if available)\n"
+                "- Links and link domains\n"
+                "- Payment-change indicator (if provided)\n"
+                "- Noise category (newsletter / sales / transactional / unknown)\n\n"
+                "KEY FINDINGS\n"
+                "- No further AI responses are allowed for this thread.\n\n"
+                "RECOMMENDED NEXT STEP\n"
+                "- Start a new thread or upgrade policy/settings if you need more help.\n"
+            )
+        )
+
+    context = build_context(req)
+    is_followup = bool(req.userMessage and req.userMessage.strip())
+
+    if mode == "pro":
+        system_prompt = SYSTEM_CHAT_PRO_FOLLOWUP if is_followup else SYSTEM_CHAT_PRO_INITIAL
+    else:
+        system_prompt = SYSTEM_CHAT_FREE_INITIAL
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt.strip()}]
+
+    history = sanitize_history_for_followups(req.history) if is_followup else (req.history or [])
+    for h in (history or [])[:12]:
+        messages.append({"role": h.role, "content": (h.content or "")[:2000]})
+
+    if is_followup:
+        messages.append({"role": "user", "content": f"EMAIL_CONTEXT_JSON:\n{context}\n\nUser question: {req.userMessage.strip()[:2000]}"})
+    else:
+        messages.append({"role": "user", "content": f"EMAIL_CONTEXT_JSON:\n{context}\n\nGenerate the initial briefing in the required format."})
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.10,
+            max_tokens=850 if mode == "pro" and not is_followup else 650,
+            messages=messages,
+        )
+        reply = (completion.choices[0].message.content or "").strip()
+        if not reply:
+            raise ValueError("Empty reply")
+
+        if mode == "pro":
+            usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
+
+        return ChatResponse(reply=reply)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI chat failed: {str(e)}")
