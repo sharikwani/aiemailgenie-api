@@ -290,6 +290,57 @@ def health_db():
 
 
 # -----------------------------
+# NEW: Manage License lookup
+# GET /api/manage/lookup?session_id=cs_...
+# -----------------------------
+@app.get("/api/manage/lookup")
+def manage_license_lookup(session_id: str):
+    """
+    Browser calls this endpoint (Render).
+    Backend calls Worker admin endpoint /admin/license/by-session (Cloudflare).
+    Returns SAFE fields only (masked license key).
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="missing_session_id")
+
+    # Worker/DB gateway must be configured
+    require_db_api_config()
+
+    # Call Worker
+    data = db_get(f"/admin/license/by-session?session_id={session_id}", timeout=15)
+
+    # Expected Worker response:
+    # { ok: true, license_key: "...", plan: "...", expires_at: "..." }
+    license_key = (data.get("license_key") or "").strip()
+    plan = data.get("plan")
+    expires_at = data.get("expires_at")
+
+    masked = "—"
+    if len(license_key) > 8:
+        masked = f"{license_key[:4]}…{license_key[-4:]}"
+
+    # Compute a simple status for UI
+    status = "active"
+    try:
+        if expires_at:
+            # Worker stores ISO timestamp; compare to now
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if exp < datetime.now(timezone.utc):
+                status = "expired"
+    except Exception:
+        status = "active"
+
+    return {
+        "plan": plan,
+        "status": status,
+        "expires_at": expires_at,
+        "license_key_masked": masked,
+    }
+
+
+# -----------------------------
 # Stripe Webhook (Checkout fulfillment)
 # -----------------------------
 @app.post("/stripe/webhook")
@@ -399,7 +450,8 @@ async def stripe_webhook(request: Request):
     # Send license email (best-effort)
     license_key = (created.get("license_key") or "").strip()
     if license_key:
-        send_license_email(email, license_key, plan_label=plan_payload.get("label") or "AI Mail Genie Pro")
+        # FIXED: parameter name is plan_name (not plan_label)
+        send_license_email(email, license_key, plan_name=plan_payload.get("label") or "AI Mail Genie Pro")
 
     return {"ok": True, "fulfilled": True, "license": created}
 
