@@ -27,6 +27,11 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
 app = FastAPI(title="AI Mail Genie AI API", version="3.3.1")
 
+# 🔴 REQUIRED FOR RENDER HEALTH CHECK 🔴
+@app.get("/")
+def root():
+    return {"ok": True}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # DEV ONLY (lock down later)
