@@ -45,22 +45,93 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 # -----------------------------
 # Email delivery (Resend) - best effort
 # -----------------------------
-def send_license_email(to_email: str, license_key: str, plan_label: str = "AI Mail Genie Pro") -> None:
+def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro") -> None:
     """
-    Best-effort email send. Never raises (so Stripe fulfillment doesn't break).
-    Requires:
-      RESEND_API_KEY
-      FROM_EMAIL (optional)
+    Sends a premium, branded license email via Resend.
+    Best-effort only — never raises.
     """
+
     to_email = (to_email or "").strip().lower()
     license_key = (license_key or "").strip()
-    plan_label = (plan_label or "AI Mail Genie Pro").strip()
 
     api_key = (os.environ.get("RESEND_API_KEY", "") or "").strip()
-    from_email = (os.environ.get("FROM_EMAIL", "license@aiemailgenie.com") or "").strip()
+    from_email = (os.environ.get("FROM_EMAIL", "AI Mail Genie <license@aiemailgenie.com>")).strip()
 
     if not api_key or not to_email or "@" not in to_email or not license_key:
         return
+
+    subject = f"Welcome to AI Mail Genie {plan_name} ✨ Your License Is Ready"
+
+    html = f"""
+    <html>
+      <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
+          <tr>
+            <td align="center">
+              <table width="600" cellpadding="0" cellspacing="0" style="background:#111827;border-radius:16px;overflow:hidden;box-shadow:0 0 40px rgba(0,255,200,0.08);">
+
+                <!-- HEADER -->
+                <tr>
+                  <td style="padding:32px;text-align:center;background:linear-gradient(135deg,#0ea5e9,#22c55e);">
+                    <img src="https://aiemailgenie.com/logo.png" alt="AI Mail Genie" width="64" style="margin-bottom:12px;" />
+                    <h1 style="margin:0;font-size:26px;font-weight:700;color:#041014;">
+                      Welcome to AI Mail Genie {plan_name}
+                    </h1>
+                  </td>
+                </tr>
+
+                <!-- BODY -->
+                <tr>
+                  <td style="padding:32px;">
+                    <p style="font-size:16px;line-height:1.6;margin-top:0;">
+                      Thank you for choosing <strong>AI Mail Genie</strong>.
+                      Your purchase was successful, and your license is now active.
+                    </p>
+
+                    <p style="font-size:15px;color:#cbd5e1;">
+                      <strong>Account email:</strong> {to_email}<br/>
+                      <strong>Plan:</strong> AI Mail Genie {plan_name}
+                    </p>
+
+                    <!-- LICENSE BOX -->
+                    <div style="margin:28px 0;padding:20px;border-radius:12px;background:#020617;border:1px solid #1f2933;">
+                      <p style="margin:0 0 8px 0;color:#94a3b8;font-size:14px;">
+                        Your license key
+                      </p>
+                      <div style="font-size:18px;font-weight:700;letter-spacing:1px;color:#22c55e;">
+                        {license_key}
+                      </div>
+                    </div>
+
+                    <!-- HOW TO ACTIVATE -->
+                    <h3 style="margin-bottom:10px;">How to activate</h3>
+                    <ol style="padding-left:20px;color:#e5e7eb;font-size:15px;line-height:1.6;">
+                      <li>Open Gmail</li>
+                      <li>Click <strong>AI Mail Genie → Settings</strong></li>
+                      <li>Paste your license key</li>
+                    </ol>
+
+                    <p style="margin-top:24px;font-size:14px;color:#9ca3af;">
+                      If you need help or have questions, simply reply to this email —
+                      we’re happy to help.
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- FOOTER -->
+                <tr>
+                  <td style="padding:20px;text-align:center;font-size:12px;color:#64748b;background:#020617;">
+                    © {2026} AI Mail Genie · Security-first email intelligence
+                  </td>
+                </tr>
+
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+    """
 
     try:
         requests.post(
@@ -72,23 +143,8 @@ def send_license_email(to_email: str, license_key: str, plan_label: str = "AI Ma
             json={
                 "from": from_email,
                 "to": [to_email],
-                "subject": f"Your {plan_label} License",
-                "html": f"""
-                    <div style="font-family: Arial, sans-serif; line-height: 1.4;">
-                      <h2>Welcome to {plan_label}</h2>
-                      <p>Your license key:</p>
-                      <div style="padding:12px;border:1px solid #ddd;border-radius:8px;display:inline-block;">
-                        <code style="font-size:16px;font-weight:bold;">{license_key}</code>
-                      </div>
-                      <h3 style="margin-top:18px;">How to activate</h3>
-                      <ol>
-                        <li>Open Gmail</li>
-                        <li>Click <strong>AI Mail Genie</strong> → <strong>Settings</strong></li>
-                        <li>Paste your license key</li>
-                      </ol>
-                      <p>If you need help, reply to this email.</p>
-                    </div>
-                """,
+                "subject": subject,
+                "html": html,
             },
             timeout=10,
         )
