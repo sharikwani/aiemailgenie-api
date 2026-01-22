@@ -855,6 +855,77 @@ def decide_verdict(
 # -----------------------------
 # License gate (uses Worker)
 # -----------------------------
+def _parse_iso_dt(s: Any) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _infer_tier_from_expiry(expires_at: Optional[str]) -> str:
+    """
+    Best-effort tier inference when Worker does not provide tier.
+    - None/empty => lifetime
+    - Otherwise, compare remaining days to infer monthly vs yearly
+    """
+    if not expires_at:
+        return "lifetime"
+
+    exp = _parse_iso_dt(expires_at)
+    if not exp:
+        # Unknown format: safest default is yearly (still time-bound)
+        return "yearly"
+
+    now = datetime.now(timezone.utc)
+    delta_days = (exp - now).days
+
+    # Heuristic: <= ~45 days => monthly, else yearly
+    if delta_days <= 45:
+        return "monthly"
+    return "yearly"
+
+
+def _normalize_plan(plan: Any, expires_at: Any = None) -> Dict[str, Any]:
+    """
+    Normalize arbitrary plan data into the extension-friendly shape:
+      { mode:"pro|free", tier:"monthly|yearly|lifetime|free", expiresAt:str|None, strictness:"normal|..." }
+    """
+    # Default free plan
+    out = {"mode": "free", "tier": "free", "expiresAt": None, "strictness": "normal"}
+
+    if not isinstance(plan, dict):
+        # Try to infer from expires_at only
+        ea = (str(expires_at).strip() if expires_at else None)
+        if ea:
+            out.update({"mode": "pro", "tier": _infer_tier_from_expiry(ea), "expiresAt": ea})
+        return out
+
+    mode = (plan.get("mode") or plan.get("plan_mode") or plan.get("status") or "").strip().lower()
+    tier = (plan.get("tier") or plan.get("interval") or plan.get("plan_tier") or "").strip().lower()
+    strictness = (plan.get("strictness") or "normal").strip().lower()
+
+    # expiry could be in plan or passed separately
+    expires_at_val = plan.get("expiresAt") or plan.get("expires_at") or expires_at
+    expires_at_str = (str(expires_at_val).strip() if expires_at_val else None)
+
+    if mode not in ("free", "pro"):
+        # Many backends store "plan": "pro"
+        maybe = (plan.get("plan") or plan.get("name") or "").strip().lower()
+        mode = "pro" if maybe == "pro" else "free"
+
+    if mode == "free":
+        return out
+
+    # mode == pro
+    if tier not in ("monthly", "yearly", "lifetime"):
+        tier = _infer_tier_from_expiry(expires_at_str)
+
+    out.update({"mode": "pro", "tier": tier, "expiresAt": expires_at_str, "strictness": strictness})
+    return out
+
+
 def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[str, Any]:
     license_key = (license_key or "").strip()
     device_id = (device_id or "").strip()
@@ -868,15 +939,24 @@ def license_validate_or_free_fallback(license_key: str, device_id: str) -> Dict[
     try:
         data = db_post("/license/validate", {"license_key": license_key, "device_id": device_id}, timeout=12)
 
+        # Variant A: { valid: bool, plan: {...}, license_id: ... }
         if isinstance(data, dict) and "valid" in data:
             if data.get("valid") is True:
-                plan = data.get("plan") or {}
-                return {"ok": True, "mode": "pro", "license_id": data.get("license_id"), "plan": plan}
+                plan_raw = data.get("plan") or {}
+                expires_at = data.get("expires_at") or (plan_raw.get("expires_at") if isinstance(plan_raw, dict) else None)
+                plan_norm = _normalize_plan(plan_raw, expires_at=expires_at)
+                return {"ok": True, "mode": "pro", "license_id": data.get("license_id"), "plan": plan_norm}
             return {"ok": True, "mode": "free", "reason": data.get("reason", "invalid")}
 
+        # Variant B: { ok: true, mode: "pro"|"free", plan: {...} }
         if isinstance(data, dict) and data.get("ok") is True:
             mode = (data.get("mode") or "free").lower().strip()
-            return {"ok": True, "mode": "pro" if mode == "pro" else "free"}
+            plan_raw = data.get("plan") or {}
+            expires_at = data.get("expires_at") or (plan_raw.get("expires_at") if isinstance(plan_raw, dict) else None)
+            plan_norm = _normalize_plan(plan_raw, expires_at=expires_at)
+            if mode == "pro":
+                return {"ok": True, "mode": "pro", "plan": plan_norm}
+            return {"ok": True, "mode": "free"}
 
         return {"ok": True, "mode": "free"}
 
@@ -895,6 +975,116 @@ def usage_increment_best_effort(license_key: str, device_id: str, amount: int = 
         db_post("/usage/increment", {"license_key": license_key, "device_id": device_id, "amount": int(amount)}, timeout=12)
     except Exception:
         return
+
+
+# -----------------------------
+# NEW: License activation endpoint for the extension
+# -----------------------------
+class LicenseActivateRequest(BaseModel):
+    licenseKey: str = Field(default="", max_length=80)
+    deviceId: str = Field(default="", max_length=120)
+
+
+class PlanOut(BaseModel):
+    mode: Literal["free", "pro"] = "free"
+    tier: Literal["free", "monthly", "yearly", "lifetime"] = "free"
+    expiresAt: Optional[str] = None
+    strictness: Literal["normal", "strict_finance", "low_noise"] = "normal"
+
+
+class LicenseActivateResponse(BaseModel):
+    ok: bool = False
+    error: Optional[str] = None
+    plan: Optional[PlanOut] = None
+
+
+def _worker_license_activate_or_validate(license_key: str, device_id: str) -> Dict[str, Any]:
+    """
+    Calls Worker endpoint to bind/activate the license on a device.
+
+    Preferred: POST /license/activate
+    Fallback:  POST /license/validate  (if activate doesn't exist yet)
+    """
+    require_db_api_config()
+
+    payload = {"license_key": license_key, "device_id": device_id}
+
+    # Try /license/activate first
+    try:
+        data = db_post("/license/activate", payload, timeout=12)
+        if isinstance(data, dict):
+            return data
+        return {"ok": False, "reason": "bad_response"}
+    except HTTPException as e:
+        # If Worker doesn't have the route yet, fallback to validate.
+        # Many worker gateways will return 404 here.
+        if int(getattr(e, "status_code", 500)) == 404:
+            data = db_post("/license/validate", payload, timeout=12)
+            return data if isinstance(data, dict) else {"ok": False, "reason": "bad_response"}
+        # Propagate other errors (502 etc.)
+        raise
+
+
+@app.post("/license/activate", response_model=LicenseActivateResponse)
+def license_activate(req: LicenseActivateRequest):
+    """
+    Server-authoritative license activation for the browser extension.
+
+    Returns:
+      { ok:true, plan:{mode:"pro", tier:"monthly|yearly|lifetime", expiresAt: str|null, strictness:"normal"} }
+    On invalid/expired/revoked/device_limit:
+      { ok:false, error:"invalid_key|expired|revoked|device_limit_reached|..." }
+    """
+    license_key = (req.licenseKey or "").strip()
+    device_id = (req.deviceId or "").strip()
+
+    if not license_key:
+        return LicenseActivateResponse(ok=False, error="licenseKey_required", plan=PlanOut(mode="free", tier="free"))
+    if not device_id:
+        return LicenseActivateResponse(ok=False, error="deviceId_required", plan=PlanOut(mode="free", tier="free"))
+
+    # If DB is not configured, fail closed (do not grant Pro).
+    if not DB_API_URL or not DB_API_KEY:
+        return LicenseActivateResponse(ok=False, error="db_not_configured", plan=PlanOut(mode="free", tier="free"))
+
+    try:
+        data = _worker_license_activate_or_validate(license_key, device_id)
+
+        # Handle Worker response variants.
+        # Variant A: { valid: bool, reason: "...", plan: {...}, expires_at:"..." }
+        if isinstance(data, dict) and "valid" in data:
+            if data.get("valid") is True:
+                plan_raw = data.get("plan") or {}
+                expires_at = data.get("expires_at") or (plan_raw.get("expires_at") if isinstance(plan_raw, dict) else None)
+                plan_norm = _normalize_plan(plan_raw, expires_at=expires_at)
+                return LicenseActivateResponse(ok=True, plan=PlanOut(**plan_norm))
+            reason = (data.get("reason") or "invalid_key").strip()
+            # Normalize a few common reasons
+            if reason in ("invalid", "invalid_license", "invalid_key"):
+                reason = "invalid_key"
+            return LicenseActivateResponse(ok=False, error=reason, plan=PlanOut(mode="free", tier="free"))
+
+        # Variant B: { ok:true, mode:"pro|free", plan:{...}, reason:"..." }
+        if isinstance(data, dict) and data.get("ok") is True:
+            mode = (data.get("mode") or "free").strip().lower()
+            if mode == "pro":
+                plan_raw = data.get("plan") or {}
+                expires_at = data.get("expires_at") or (plan_raw.get("expires_at") if isinstance(plan_raw, dict) else None)
+                plan_norm = _normalize_plan(plan_raw, expires_at=expires_at)
+                return LicenseActivateResponse(ok=True, plan=PlanOut(**plan_norm))
+            # ok:true but free
+            reason = (data.get("reason") or "invalid_key").strip()
+            return LicenseActivateResponse(ok=False, error=reason, plan=PlanOut(mode="free", tier="free"))
+
+        # Unknown shape: treat as invalid
+        return LicenseActivateResponse(ok=False, error="invalid_key", plan=PlanOut(mode="free", tier="free"))
+
+    except HTTPException as e:
+        # If Worker returns an error payload, you may see it in e.detail.
+        # Fail closed: do not grant Pro.
+        return LicenseActivateResponse(ok=False, error="activation_failed", plan=PlanOut(mode="free", tier="free"))
+    except Exception:
+        return LicenseActivateResponse(ok=False, error="activation_failed", plan=PlanOut(mode="free", tier="free"))
 
 
 # -----------------------------
