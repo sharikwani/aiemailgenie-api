@@ -45,7 +45,7 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 # -----------------------------
 # Email delivery (Resend) - best effort
 # -----------------------------
-def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro") -> None:
+def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro", session_id: str = "") -> None:
     """
     Sends a premium, branded license email via Resend.
     Best-effort only — never raises.
@@ -63,6 +63,8 @@ def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro") 
     subject = f"Welcome to AI Mail Genie {plan_name} ✨ Your License Is Ready"
 
     html = f"""
+        sid = (session_id or "").strip()
+    manage_url = f"https://aiemailgenie.com/manage.html?session_id={sid}" if sid else "https://aiemailgenie.com/manage.html"
     <html>
       <body style="margin:0;padding:0;background:#0b0f14;font-family:Inter,Segoe UI,Arial,sans-serif;color:#ffffff;">
         <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 0;">
@@ -102,6 +104,18 @@ def send_license_email(to_email: str, license_key: str, plan_name: str = "Pro") 
                         {license_key}
                       </div>
                     </div>
+                                        <!-- MANAGE LICENSE BUTTON -->
+                    <div style="margin: 18px 0 8px 0;">
+                      <a href="{manage_url}"
+                         style="display:inline-block;padding:12px 16px;border-radius:12px;
+                                background:linear-gradient(135deg,#0ea5e9,#22c55e);
+                                color:#041014;font-weight:800;text-decoration:none;">
+                        Manage License
+                      </a>
+                    </div>
+                    <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5;">
+                      Use this link to view your plan, expiry, and manage your license anytime.
+                    </p>
 
                     <!-- HOW TO ACTIVATE -->
                     <h3 style="margin-bottom:10px;">How to activate</h3>
