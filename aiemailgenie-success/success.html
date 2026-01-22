@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Payment Successful</title>
+</head>
+<body>
+  <h1>Payment Successful 🎉</h1>
+  <p>Loading your license…</p>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get("session_id");
+
+    if (!sessionId) {
+      document.body.innerHTML = "<h2>Missing session ID</h2>";
+    }
+  </script>
+</body>
+</html>
