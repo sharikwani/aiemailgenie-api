@@ -362,7 +362,45 @@ def manage_license_lookup(session_id: str):
         "expires_at": expires_at,
         "license_key_masked": masked,
     }
+# -----------------------------
+# NEW: Stripe Billing Portal (Customer Portal)
+# POST /api/billing/portal
+# Body: { "session_id": "cs_..." }
+# Returns: { ok: true, url: "https://billing.stripe.com/..." }
+# -----------------------------
+@app.post("/api/billing/portal")
+def billing_portal(payload: Dict[str, Any]):
+    require_stripe_config()
 
+    session_id = (payload.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="missing_session_id")
+
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    # Retrieve the Checkout Session so we can identify the Stripe Customer
+    try:
+        checkout = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"stripe_checkout_retrieve_failed: {str(e)}")
+
+    customer_id = getattr(checkout, "customer", None)
+    customer_id = customer_id if isinstance(customer_id, str) else ""
+
+    if not customer_id:
+        # This can happen for one-time payments or unusual checkout configs
+        raise HTTPException(status_code=400, detail="no_customer_on_session")
+
+    # Create the portal session
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url="https://aiemailgenie.com/manage.html",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"stripe_portal_create_failed: {str(e)}")
+
+    return {"ok": True, "url": portal.url}
 
 # -----------------------------
 # Stripe Webhook (Checkout fulfillment)
