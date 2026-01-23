@@ -6,6 +6,8 @@ python-jose[cryptography]
 python-dotenv
 requests==2.32.3
 stripe==11.6.0
+tldextract==5.1.2
+pybloom-live==4.0.0
 
 
 
