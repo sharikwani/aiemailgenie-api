@@ -3,6 +3,11 @@ import re
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
+import json
+
+import tldextract
+from pybloom_live import BloomFilter
+
 import requests
 import stripe
 from fastapi import FastAPI, HTTPException, Request
@@ -27,6 +32,13 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
 app = FastAPI(title="AI Mail Genie AI API", version="3.3.1")
 
+# Tranco Bloom: load once on boot (best-effort; never crash app)
+app.state.tranco_bloom = None
+
+@app.on_event("startup")
+def _startup_load_tranco_bloom():
+    app.state.tranco_bloom = _load_tranco_bloom_best_effort()
+
 # 🔴 REQUIRED FOR RENDER HEALTH CHECK 🔴
 @app.get("/")
 def root():
@@ -39,6 +51,65 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# -----------------------------
+# Tranco Bloom legitimacy signal (best-effort; NOT a trust override)
+# -----------------------------
+TRANCO_BLOOM_PATH = os.path.join("artifacts", "tranco.bloom")
+
+_tranco_extractor = tldextract.TLDExtract(cache_dir=False)
+
+
+def _tranco_etld1(host: str) -> str:
+    """
+    Subdomain-safe normalization: returns eTLD+1, or "" if invalid.
+    Examples:
+      - accounts.google.com -> google.com
+      - mail.example.co.uk -> example.co.uk
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    r = _tranco_extractor(host)
+    if not r.domain or not r.suffix:
+        return ""
+    return f"{r.domain}.{r.suffix}"
+
+
+def _load_tranco_bloom_best_effort() -> "BloomFilter | None":
+    """
+    Loads artifacts/tranco.bloom if present.
+    Never raises; returns None on any failure.
+    """
+    try:
+        if not os.path.exists(TRANCO_BLOOM_PATH):
+            return None
+        with open(TRANCO_BLOOM_PATH, "rb") as f:
+            return BloomFilter.fromfile(f)
+    except Exception:
+        return None
+
+
+def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
+    """
+    Returns a lightweight signal object.
+    - tranco_present is None if bloom isn't loaded or domain invalid.
+    - tranco_present True/False otherwise.
+    This is ONLY a legitimacy signal; it must not override verdict logic.
+    """
+    base = _tranco_etld1(domain)
+    bloom = getattr(app.state, "tranco_bloom", None)
+
+    if not base:
+        return {"tranco_present": None, "tranco_base": None, "reason": "invalid_domain"}
+    if bloom is None:
+        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_unavailable"}
+
+    try:
+        return {"tranco_present": (base in bloom), "tranco_base": base, "reason": "ok"}
+    except Exception:
+        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_error"}
+
 
 
 # -----------------------------
@@ -1032,6 +1103,10 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
         "computed_link_signals": link_signals,
 
+        "legitimacy_signals": {
+            "tranco": tranco_legitimacy_signal(sender_domain),
+        },
+
         "server_decision": {
             "verdict": verdict,
             "confidence": float(conf),
@@ -1316,481 +1391,3 @@ def ai_chat(req: ChatRequest):
         return ChatResponse(reply=reply)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI chat failed: {str(e)}")
-
-import os
-import re
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Literal, Tuple
-
-import json
-
-import tldextract
-from pybloom_live import BloomFilter
-
-import requests
-import stripe
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
-# -----------------------------
-# OpenAI client (no SDK imports required here if you’re proxying)
-# -----------------------------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-
-# -----------------------------
-# Stripe
-# -----------------------------
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
-
-# -----------------------------
-# FastAPI
-# -----------------------------
-app = FastAPI(title="AI Mail Genie AI API", version="3.3.1")
-
-# Tranco Bloom: load once on boot (best-effort; never crash app)
-app.state.tranco_bloom = None
-
-@app.on_event("startup")
-def _startup_load_tranco_bloom():
-    app.state.tranco_bloom = _load_tranco_bloom_best_effort()
-
-# 🔴 REQUIRED FOR RENDER HEALTH CHECK 🔴
-@app.get("/")
-def root():
-    return {"ok": True}
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------
-# Tranco Bloom legitimacy signal (best-effort; NOT a trust override)
-# -----------------------------
-TRANCO_BLOOM_PATH = os.path.join("artifacts", "tranco.bloom")
-
-_tranco_extractor = tldextract.TLDExtract(cache_dir=False)
-
-
-def _tranco_etld1(host: str) -> str:
-    """
-    Subdomain-safe normalization: returns eTLD+1, or "" if invalid.
-    Examples:
-      - accounts.google.com -> google.com
-      - mail.example.co.uk -> example.co.uk
-    """
-    host = (host or "").strip().lower().rstrip(".")
-    if not host:
-        return ""
-    r = _tranco_extractor(host)
-    if not r.domain or not r.suffix:
-        return ""
-    return f"{r.domain}.{r.suffix}"
-
-
-def _load_tranco_bloom_best_effort() -> "BloomFilter | None":
-    """
-    Loads artifacts/tranco.bloom if present.
-    Never raises; returns None on any failure.
-    """
-    try:
-        if not os.path.exists(TRANCO_BLOOM_PATH):
-            return None
-        with open(TRANCO_BLOOM_PATH, "rb") as f:
-            return BloomFilter.fromfile(f)
-    except Exception:
-        return None
-
-
-def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
-    """
-    Returns a lightweight signal object.
-    - tranco_present is None if bloom isn't loaded or domain invalid.
-    - tranco_present True/False otherwise.
-    This is ONLY a legitimacy signal; it must not override verdict logic.
-    """
-    base = _tranco_etld1(domain)
-    bloom = getattr(app.state, "tranco_bloom", None)
-
-    if not base:
-        return {"tranco_present": None, "tranco_base": None, "reason": "invalid_domain"}
-    if bloom is None:
-        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_unavailable"}
-
-    try:
-        return {"tranco_present": (base in bloom), "tranco_base": base, "reason": "ok"}
-    except Exception:
-        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_error"}
-
-
-# -----------------------------
-# Cloudflare Workers / D1 API
-# -----------------------------
-CF_WORKER_URL = os.environ.get("CF_WORKER_URL", "")
-CF_WORKER_API_KEY = os.environ.get("CF_WORKER_API_KEY", "")
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-DOMAIN_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$", re.I)
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", re.I)
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def safe_clean_domain(d: Optional[str]) -> str:
-    if not d:
-        return ""
-    d = d.strip().lower()
-    d = d.replace("mailto:", "")
-    d = d.split("/")[0]
-    d = d.split(":")[0]
-    d = d.strip(".")
-    if DOMAIN_RE.match(d):
-        return d[:260]
-    return ""
-
-
-def safe_clean_email(e: Optional[str]) -> str:
-    if not e:
-        return ""
-    e = e.strip().lower()
-    if EMAIL_RE.match(e):
-        return e[:260]
-    return ""
-
-
-def safe_clean_url(u: Optional[str]) -> str:
-    if not u:
-        return ""
-    u = u.strip()
-    if len(u) > 2048:
-        u = u[:2048]
-    return u
-
-
-def cf_headers() -> Dict[str, str]:
-    headers = {"Content-Type": "application/json"}
-    if CF_WORKER_API_KEY:
-        headers["Authorization"] = f"Bearer {CF_WORKER_API_KEY}"
-    return headers
-
-
-def cf_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not CF_WORKER_URL:
-        raise HTTPException(status_code=500, detail="CF_WORKER_URL not set")
-    url = CF_WORKER_URL.rstrip("/") + "/" + path.lstrip("/")
-    r = requests.post(url, json=payload, headers=cf_headers(), timeout=30)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
-
-
-# -----------------------------
-# Pydantic Models
-# -----------------------------
-class ChatRequest(BaseModel):
-    provider: Optional[str] = Field(default="")
-    threadKey: Optional[str] = Field(default="")
-    strictness: Optional[Literal["balanced", "strict", "lenient"]] = Field(default="balanced")
-    mode: Optional[Literal["detect", "explain", "reply"]] = Field(default="detect")
-
-    # Email / header signals
-    senderEmail: Optional[str] = Field(default="")
-    senderDomain: Optional[str] = Field(default="")
-    mailedBy: Optional[str] = Field(default="")
-    signedBy: Optional[str] = Field(default="")
-    subject: Optional[str] = Field(default="")
-
-    linkDomains: Optional[List[str]] = Field(default_factory=list)
-    linkUrls: Optional[List[str]] = Field(default_factory=list)
-
-    # UI signals
-    paymentIntent: Optional[bool] = Field(default=False)
-    urgentIntent: Optional[bool] = Field(default=False)
-
-    # Optional message content (depends on your extension behavior)
-    snippet: Optional[str] = Field(default="")
-    bodyText: Optional[str] = Field(default="")
-
-    # Optional: user meta
-    userId: Optional[str] = Field(default="")
-    licenseKey: Optional[str] = Field(default="")
-
-
-class ChatResponse(BaseModel):
-    verdict: Literal["safe", "suspicious", "phishing"]
-    confidence: float
-    summary: str
-    recommended_action: str
-    assistant_reply: Optional[str] = None
-    debug: Optional[Dict[str, Any]] = None
-
-
-# -----------------------------
-# Link analysis helpers
-# -----------------------------
-def compute_link_signals(sender_domain: str, link_domains: List[str], link_urls: List[str]) -> Dict[str, Any]:
-    sender_domain = safe_clean_domain(sender_domain)
-    clean_link_domains = [safe_clean_domain(d) for d in link_domains if d]
-
-    external_links = []
-    for d in clean_link_domains:
-        if d and sender_domain and d != sender_domain and not d.endswith("." + sender_domain):
-            external_links.append(d)
-
-    suspicious_tlds = []
-    for d in clean_link_domains:
-        tld = d.split(".")[-1] if d else ""
-        if tld in {"zip", "mov", "click", "cam", "top", "xyz"}:
-            suspicious_tlds.append(d)
-
-    return {
-        "sender_domain": sender_domain,
-        "link_domains_count": len(clean_link_domains),
-        "external_links_count": len(external_links),
-        "external_link_domains": external_links[:10],
-        "suspicious_tld_domains": suspicious_tlds[:10],
-        "link_urls_sample": link_urls[:5],
-    }
-
-
-# -----------------------------
-# Verdict decision logic
-# -----------------------------
-def decide_verdict(strictness: str, sender_domain: str, mailed_by: str, signed_by: str, link_signals: Dict[str, Any],
-                   payment_intent: bool, urgent_intent: bool) -> Tuple[str, float, List[str]]:
-    reasons = []
-
-    strictness = strictness or "balanced"
-    sender_domain = safe_clean_domain(sender_domain)
-    mailed_by = safe_clean_domain(mailed_by)
-    signed_by = safe_clean_domain(signed_by)
-
-    if sender_domain and mailed_by and sender_domain != mailed_by:
-        reasons.append("sender_domain_mismatch_mailed_by")
-
-    if sender_domain and signed_by and sender_domain != signed_by:
-        reasons.append("sender_domain_mismatch_signed_by")
-
-    if link_signals.get("external_links_count", 0) > 0:
-        reasons.append("external_links_present")
-
-    if link_signals.get("suspicious_tld_domains"):
-        reasons.append("suspicious_tld_links")
-
-    if payment_intent:
-        reasons.append("payment_intent")
-
-    if urgent_intent:
-        reasons.append("urgent_intent")
-
-    score = 0
-    for r in reasons:
-        if r in {"sender_domain_mismatch_mailed_by", "sender_domain_mismatch_signed_by"}:
-            score += 2
-        elif r in {"suspicious_tld_links"}:
-            score += 2
-        elif r in {"external_links_present"}:
-            score += 1
-        elif r in {"payment_intent", "urgent_intent"}:
-            score += 1
-
-    if strictness == "strict":
-        threshold_phishing = 4
-        threshold_suspicious = 2
-    elif strictness == "lenient":
-        threshold_phishing = 5
-        threshold_suspicious = 3
-    else:
-        threshold_phishing = 4
-        threshold_suspicious = 2
-
-    if score >= threshold_phishing:
-        return "phishing", min(0.95, 0.6 + 0.1 * score), reasons
-    if score >= threshold_suspicious:
-        return "suspicious", min(0.9, 0.55 + 0.08 * score), reasons
-    return "safe", max(0.55, 0.8 - 0.05 * score), reasons
-
-
-# -----------------------------
-# AI (OpenAI proxy-style call)
-# -----------------------------
-def build_prompt(ctx: Dict[str, Any]) -> str:
-    # Keep your existing prompt logic intact
-    provider = ctx.get("provider", "")
-    verdict = ctx.get("server_decision", {}).get("verdict", "")
-    confidence = ctx.get("server_decision", {}).get("confidence", 0.0)
-    reasons = ctx.get("server_decision", {}).get("reasons", [])
-
-    sender_domain = ctx.get("sender_domain", "")
-    subject = ctx.get("subject", "")
-    link_signals = ctx.get("computed_link_signals", {})
-
-    # This prompt is intentionally minimal and relies on your model/system prompt elsewhere
-    return (
-        f"Provider: {provider}\n"
-        f"Subject: {subject}\n"
-        f"Sender domain: {sender_domain}\n"
-        f"Verdict: {verdict} (confidence: {confidence})\n"
-        f"Reasons: {reasons}\n"
-        f"Link signals: {link_signals}\n"
-        f"Context: {ctx}\n"
-    )
-
-
-def openai_chat(prompt: str) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
-
-    # You are currently using requests; preserve your existing approach.
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are AI Mail Genie. Provide safe, helpful, and accurate email security analysis."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=45)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
-
-
-def extract_model_text(resp: Dict[str, Any]) -> str:
-    try:
-        return resp["choices"][0]["message"]["content"]
-    except Exception:
-        return ""
-
-
-# -----------------------------
-# Context builder
-# -----------------------------
-def build_context(req: "ChatRequest") -> Dict[str, Any]:
-    sender_domain = safe_clean_domain(req.senderDomain)
-    mailed_by = safe_clean_domain(req.mailedBy)
-    signed_by = safe_clean_domain(req.signedBy)
-
-    link_signals = compute_link_signals(
-        sender_domain=sender_domain,
-        link_domains=req.linkDomains or [],
-        link_urls=req.linkUrls or [],
-    )
-
-    verdict, confidence, reasons = decide_verdict(
-        strictness=req.strictness or "balanced",
-        sender_domain=sender_domain,
-        mailed_by=mailed_by,
-        signed_by=signed_by,
-        link_signals=link_signals,
-        payment_intent=bool(req.paymentIntent),
-        urgent_intent=bool(req.urgentIntent),
-    )
-
-    ctx = {
-        "provider": (req.provider or "")[:30],
-        "thread_key": (req.threadKey or "")[:260],
-
-        "sender_email": (req.senderEmail or "")[:260],
-        "sender_domain": sender_domain,
-        "mailed_by": mailed_by,
-        "signed_by": signed_by,
-
-        "subject": (req.subject or "")[:240],
-        "link_domains": [safe_clean_domain(d) for d in (req.linkDomains or [])[:20]],
-        "link_urls": (req.linkUrls or [])[:12],
-
-        "payment_intent": bool(req.paymentIntent),
-        "urgent_intent": bool(req.urgentIntent),
-
-        "snippet": (req.snippet or "")[:2000],
-        "body_text": (req.bodyText or "")[:12000],
-
-        "user_id": (req.userId or "")[:120],
-        "license_key": (req.licenseKey or "")[:120],
-
-        "timestamp_utc": now_utc_iso(),
-
-        "plan": {"mode": req.mode, "strictness": req.strictness},
-
-        "computed_link_signals": link_signals,
-
-        "legitimacy_signals": {
-            "tranco": tranco_legitimacy_signal(sender_domain),
-        },
-
-        "server_decision": {
-            "verdict": verdict,
-            "confidence": confidence,
-            "reasons": reasons,
-        },
-    }
-
-    return ctx
-
-
-# -----------------------------
-# Main endpoint
-# -----------------------------
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    ctx = build_context(req)
-    prompt = build_prompt(ctx)
-    model_resp = openai_chat(prompt)
-    text = extract_model_text(model_resp)
-
-    # Keep your existing formatting rules; minimal stub here:
-    verdict = ctx["server_decision"]["verdict"]
-    confidence = float(ctx["server_decision"]["confidence"])
-    reasons = ctx["server_decision"]["reasons"]
-
-    summary = text.strip()[:1200] if text else "Analysis unavailable."
-    recommended_action = "Proceed normally." if verdict == "safe" else "Use caution."
-
-    return ChatResponse(
-        verdict=verdict,
-        confidence=confidence,
-        summary=summary,
-        recommended_action=recommended_action,
-        assistant_reply=text[:2000] if text else None,
-        debug={
-            "reasons": reasons,
-            "computed_link_signals": ctx.get("computed_link_signals"),
-            "legitimacy_signals": ctx.get("legitimacy_signals"),
-        },
-    )
-
-
-# -----------------------------
-# Stripe webhook (preserve existing if present)
-# -----------------------------
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-
-    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-    if not endpoint_secret:
-        raise HTTPException(status_code=500, detail="STRIPE_WEBHOOK_SECRET not set")
-
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Your existing event handling logic likely follows here; keep as-is.
-    return {"received": True, "type": event.get("type")}
