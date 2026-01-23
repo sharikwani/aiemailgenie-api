@@ -1,0 +1,7 @@
+{
+  "source": "tranco",
+  "items_capacity": 1000000,
+  "error_rate": 0.01,
+  "sha256": "e512d7e419e5547f28d93b687a660318b40bb3ccd49664b47df9ed12f9e76823",
+  "format": "pybloom_live.tofile"
+}
