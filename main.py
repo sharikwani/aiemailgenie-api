@@ -1238,8 +1238,8 @@ def decide_verdict(
 # -----------------------------
 # Core endpoint (UNCHANGED)
 # -----------------------------
-@app.post("/ai/chat", response_model="ChatResponse")
-def ai_chat(req: "ChatRequest"):
+@app.post("/ai/chat", response_model=ChatResponse)
+def ai_chat(req: ChatRequest):
     require_openai_api_key()
 
     license_info = license_validate_or_free_fallback(req.licenseKey, req.deviceId)
