@@ -1940,40 +1940,50 @@ def decide_verdict(
     # Helper: detect payment/billing pressure language
     # -----------------------------
     def _looks_like_payment_request(subj: str, snip: str) -> bool:
-        t = f"{subj or ''}\\n{snip or ''}".lower()
+        t = f"{subj or ''}\n{snip or ''}".lower()
         keywords = [
             "payment", "billing", "invoice", "renew", "renewal", "subscription",
             "update payment", "update your payment", "payment method", "card expired",
             "failed payment", "payment declined", "charge", "refund",
             "account blocked", "account suspended", "suspended", "blocked",
             "verify your account", "verify billing", "confirm payment",
-            "immediately", "urgent", "action required",
+            "action required", "immediately", "urgent",
         ]
         return any(k in t for k in keywords)
 
-    def _payment_pressure_level(subj: str, snip: str) -> int:
-        """0 = none, 1 = billing-ish, 2 = threat/urgency billing."""
+    def _looks_like_threat_or_data_loss(subj: str, snip: str) -> bool:
         t = f"{subj or ''}\n{snip or ''}".lower()
-        threat = [
-            "account suspended", "account suspension", "account blocked", "blocked",
-            "your account will be", "we've blocked", "will be deleted", "deleted",
-            "action required", "immediately", "urgent", "final notice",
-            "expires today", "expires tomorrow", "avoid interruption",
-            "payment declined", "failed payment", "payment failed",
-            "update payment details", "update your payment",
+        threats = [
+            "will be deleted", "will be removed", "permanently deleted",
+            "account will be deleted", "photos", "videos", "data will be deleted",
+            "within 24", "within 48", "today", "tomorrow",
+            "final notice", "last chance", "avoid suspension",
         ]
-        billing = [
-            "payment", "billing", "invoice", "renew", "renewal", "subscription",
-            "payment method", "card expired", "charge", "refund",
-        ]
-        if any(k in t for k in threat):
-            return 2
-        if any(k in t for k in billing):
-            return 1
-        return 0
+        return any(k in t for k in threats)
+
+    def _looks_randomish_domain(d: str) -> bool:
+        # Very lightweight heuristic: domains used in phishing often have
+        # short labels with digits and few/no vowels (e.g. ktk56c.us).
+        base = (d or "").strip().lower()
+        if not base or "." not in base:
+            return False
+        label = base.split(".")[0]
+        if len(label) < 5:
+            return False
+        has_digit = any(ch.isdigit() for ch in label)
+        vowels = sum(1 for ch in label if ch in "aeiou")
+        # No/low vowels + digits is a strong "random string" hint.
+        if has_digit and vowels == 0:
+            return True
+        # High digit ratio is also suspicious.
+        digit_ratio = (sum(1 for ch in label if ch.isdigit()) / max(1, len(label)))
+        if digit_ratio >= 0.30:
+            return True
+        return False
 
     payment_request = bool(payment_intent) or _looks_like_payment_request(subject, redacted_snippet)
-    pressure_level = _payment_pressure_level(subject, redacted_snippet)
+    threatening = _looks_like_threat_or_data_loss(subject, redacted_snippet)
+    randomish_sender = _looks_randomish_domain(sender_domain)
 
     # -----------------------------
     # Risk flags
@@ -2026,28 +2036,41 @@ def decide_verdict(
         moderate_flags = max(0, moderate_flags - 1)
 
     # -----------------------------
-    # Payment-request escalation rule
+    # NEW: stronger payment-request escalation
     # -----------------------------
+    # Key principle: "payment/billing + weak authenticity" is a primary phishing pattern.
     if payment_request and not payment_changed:
-        weak_legitimacy = (legitimacy < 2)
+        weak_auth = (legitimacy < 2)  # missing mailed-by/signed-by alignment
 
-        if weak_legitimacy and (link_signals.get("has_sender_mismatch_domains") or link_signals.get("has_shortener")):
-            reasons.append("Email requests billing/payment action with weak sender authenticity and non-matching link domains.")
+        if threatening:
+            reasons.append("Email uses urgency/threats of account/data loss alongside a billing/payment request.")
+            if weak_auth or randomish_sender:
+                return "HIGH RISK", 0.92, reasons
+
+        if randomish_sender and weak_auth:
+            reasons.append("Sender domain looks random/untrusted and lacks strong authenticity signals for a billing/payment request.")
+            return "HIGH RISK", 0.90, reasons
+
+        # Link mismatch/obfuscation is still a strong pattern.
+        if weak_auth and (link_signals.get("has_sender_mismatch_domains") or link_signals.get("has_shortener")):
+            reasons.append("Email requests billing/payment action with weak sender authenticity and non-matching/obfuscated link domains.")
+            return "HIGH RISK", 0.88, reasons
+
+        # Strict finance: be more aggressive even without link mismatch.
+        if strict_finance and weak_auth:
+            reasons.append("Email requests billing/payment action with weak sender authenticity (strict finance mode).")
             return "HIGH RISK", 0.86, reasons
 
-        if strict_finance and weak_legitimacy:
-            reasons.append("Email requests billing/payment action with weak sender authenticity (strict finance mode).")
-            return "HIGH RISK", 0.82, reasons
-
-        if weak_legitimacy:
+        # Otherwise: never SAFE on payment request without strong authenticity.
+        if weak_auth:
             reasons.append("Email requests billing/payment action but sender authenticity signals are weak.")
             moderate_flags = max(moderate_flags, 1)
 
     # -----------------------------
-    # Existing decision logic (with guards for payment requests)
+    # Existing decision logic (with guards)
     # -----------------------------
     if strong_flags >= 2 or (strong_flags >= 1 and moderate_flags >= 2):
-        confidence = 0.85 if strong_flags >= 2 else 0.75
+        confidence = 0.88 if strong_flags >= 2 else 0.78
         return "HIGH RISK", confidence, reasons
 
     if strong_flags == 0:
