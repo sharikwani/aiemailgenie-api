@@ -1721,20 +1721,17 @@ def sanitize_history_for_followups(history: List["ChatMessage"]) -> List["ChatMe
     return trimmed
 
 
-def build_context(req: "ChatRequest") -> Dict[str, Any]:
-    sender_domain = safe_clean_domain(req.senderDomain)
-    mailed_by = safe_clean_domain(req.mailedBy)
-    signed_by = safe_clean_domain(req.signedBy)
-
-    link_signals = compute_link_signals(
-        sender_domain=sender_domain,
-        link_urls=req.linkUrls or [],
-        link_domains=req.linkDomains or []
-    )
-
-    noise = classify_noise(req.subject, req.redactedSnippet)
-
-    verdict, conf, verdict_reasons = decide_verdict(
+verdict, conf, verdict_reasons = decide_verdict(
+    sender_domain=sender_domain,
+    mailed_by=mailed_by,
+    signed_by=signed_by,
+    payment_changed=bool(req.paymentChanged),
+    payment_intent=bool(req.paymentIntent),
+    link_signals=link_signals,
+    strictness=req.strictness,
+    subject=req.subject,
+    redacted_snippet=req.redactedSnippet,
+)
         sender_domain=sender_domain,
         mailed_by=mailed_by,
         signed_by=signed_by,
@@ -1924,6 +1921,9 @@ def decide_verdict(
     payment_intent: bool,
     link_signals: Dict[str, Any],
     strictness: str = "normal",
+    # NEW (backwards-compatible): pass these from build_context when available
+    subject: str = "",
+    redacted_snippet: str = "",
 ) -> Tuple[Verdict, float, List[str]]:
     sender_domain = safe_clean_domain(sender_domain)
     mailed_by = safe_clean_domain(mailed_by)
@@ -1931,6 +1931,27 @@ def decide_verdict(
 
     reasons: List[str] = []
 
+    # -----------------------------
+    # Helper: detect payment/billing pressure language
+    # -----------------------------
+    def _looks_like_payment_request(subj: str, snip: str) -> bool:
+        t = f"{subj or ''}\n{snip or ''}".lower()
+        # High-signal phrases for phishing-style billing pressure
+        keywords = [
+            "payment", "billing", "invoice", "renew", "renewal", "subscription",
+            "update payment", "update your payment", "payment method", "card expired",
+            "failed payment", "payment declined", "charge", "refund",
+            "account blocked", "account suspended", "suspended", "blocked",
+            "verify your account", "verify billing", "confirm payment",
+            "immediately", "urgent", "action required",
+        ]
+        return any(k in t for k in keywords)
+
+    payment_request = bool(payment_intent) or _looks_like_payment_request(subject, redacted_snippet)
+
+    # -----------------------------
+    # Risk flags
+    # -----------------------------
     strong_flags = 0
     if payment_changed:
         strong_flags += 1
@@ -1958,6 +1979,9 @@ def decide_verdict(
         moderate_flags += 1
         reasons.append("Link domains differ from the sender domain (moderate risk).")
 
+    # -----------------------------
+    # Legitimacy / alignment checks
+    # -----------------------------
     legitimacy = 0
     if sender_domain:
         legitimacy += 1
@@ -1975,14 +1999,48 @@ def decide_verdict(
     if low_noise and moderate_flags > 0 and not payment_changed:
         moderate_flags = max(0, moderate_flags - 1)
 
+    # -----------------------------
+    # NEW: Payment-request escalation rule
+    # -----------------------------
+    # If the email is pushing payment/renewal/billing actions, we require stronger legitimacy.
+    # Unknown/weakly-aligned senders + any link mismatch/obfuscation => HIGH RISK.
+    if payment_request and not payment_changed:
+        # Weak legitimacy: missing alignment signals (mailed-by/signed-by) is common in phishing
+        weak_legitimacy = (legitimacy < 2)
+
+        # If it’s a payment request and links don’t align, treat as strong phishing pattern
+        if weak_legitimacy and (link_signals.get("has_sender_mismatch_domains") or link_signals.get("has_shortener")):
+            reasons.append("Email requests billing/payment action with weak sender authenticity and non-matching link domains.")
+            return "HIGH RISK", 0.86, reasons
+
+        # Strict finance mode: be more aggressive even without link mismatch
+        if strict_finance and weak_legitimacy:
+            reasons.append("Email requests billing/payment action with weak sender authenticity (strict finance mode).")
+            return "HIGH RISK", 0.82, reasons
+
+        # Otherwise, at minimum CAUTION (never SAFE) for payment requests without strong authenticity
+        if weak_legitimacy:
+            reasons.append("Email requests billing/payment action but sender authenticity signals are weak.")
+            # keep evaluating other flags; will fall through to CAUTION below
+            moderate_flags = max(moderate_flags, 1)
+
+    # -----------------------------
+    # Existing decision logic (unchanged ordering, but now influenced by the new rule)
+    # -----------------------------
     if strong_flags >= 2 or (strong_flags >= 1 and moderate_flags >= 2):
         confidence = 0.85 if strong_flags >= 2 else 0.75
         return "HIGH RISK", confidence, reasons
 
     if strong_flags == 0:
         if moderate_flags == 0:
+            # NEW safety guard: never return SAFE if we detected a payment request
+            if payment_request:
+                return "CAUTION", 0.62 if not strict_finance else 0.58, reasons
             return "SAFE", 0.82, reasons
         if legitimacy >= 2 and not payment_changed:
+            # NEW safety guard: never return SAFE if we detected a payment request
+            if payment_request:
+                return "CAUTION", 0.62 if not strict_finance else 0.58, reasons
             return "SAFE", 0.72, reasons
 
     base_conf = 0.62
@@ -1990,8 +2048,8 @@ def decide_verdict(
         base_conf = 0.60
     if strict_finance and payment_intent and strong_flags == 0:
         base_conf = min(base_conf, 0.58)
-    return "CAUTION", base_conf, reasons
 
+    return "CAUTION", base_conf, reasons
 
 # -----------------------------
 # Core endpoint (UNCHANGED)
