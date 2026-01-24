@@ -499,7 +499,48 @@ def db_post(path: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, 
 # -----------------------------
 @app.get("/admin/domain-override")
 def admin_proxy_get_domain_override(request: Request, etld1: str):
-    """
+    require_admin_token(request)
+    require_db_api_config()
+
+    etld1_val = safe_clean_domain(etld1)
+    if not etld1_val:
+        raise HTTPException(status_code=400, detail="invalid_etld1")
+
+    return db_get(f"/admin/domain-override?etld1={requests.utils.quote(etld1_val)}", timeout=15)
+
+
+class DomainOverrideUpsertRequest(BaseModel):
+    etld1: str = Field(default="", max_length=200)
+    action: Literal["allow", "deny"]
+
+
+@app.post("/admin/domain-overrides/upsert")
+def admin_proxy_upsert_domain_override(request: Request, body: DomainOverrideUpsertRequest):
+    require_admin_token(request)
+    require_db_api_config()
+
+    etld1_val = safe_clean_domain(body.etld1)
+    if not etld1_val:
+        raise HTTPException(status_code=400, detail="invalid_etld1")
+
+    if body.action not in ("allow", "deny"):
+        raise HTTPException(status_code=400, detail="invalid_action")
+
+    return db_post(
+        "/admin/domain-overrides/upsert",
+        {"etld1": etld1_val, "action": body.action},
+        timeout=15,
+    )
+
+
+# ✅ INSERT THIS RIGHT HERE — DO NOT MOVE IT
+@app.get("/admin/tranco-signal")
+def admin_tranco_signal(request: Request, domain: str):
+    require_admin_token(request)
+    d = safe_clean_domain(domain)
+    if not d:
+        raise HTTPException(status_code=400, detail="invalid_domain")
+    return tranco_legitimacy_signal(d)
     Laptop/Admin UI -> Render (X-Admin-Token)
     Render -> Worker (X-DB-KEY)
     """
