@@ -112,6 +112,25 @@ def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
 
 
 
+
+def same_etld1(a: str, b: str) -> bool:
+    """True if both domains share the same eTLD+1 (organizational domain)."""
+    a_base = _tranco_etld1(a)
+    b_base = _tranco_etld1(b)
+    return bool(a_base) and (a_base == b_base)
+
+
+def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_present: Any) -> Tuple[float, bool]:
+    """
+    If the sender domain appears in Tranco Top 1M, slightly dampen confidence for risky verdicts.
+    This does NOT change the verdict (signal only).
+    """
+    if tranco_present is True and verdict in {"HIGH RISK", "CAUTION"}:
+        new_conf = max(0.55, float(confidence) - 0.08)
+        return new_conf, (new_conf != float(confidence))
+    return float(confidence), False
+
+
 # -----------------------------
 # Cloudflare Worker DB API (D1 Gateway)
 # -----------------------------
@@ -541,6 +560,8 @@ async def stripe_webhook(request: Request):
             plan_name=plan_payload.get("label") or "AI Mail Genie Pro",
             session_id=session_id,
         )
+
+    tranco = tranco_legitimacy_signal(sender_domain)
 
     return {"ok": True, "fulfilled": True, "license": created}
 
@@ -1104,8 +1125,21 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "computed_link_signals": link_signals,
 
         "legitimacy_signals": {
-            "tranco": tranco_legitimacy_signal(sender_domain),
+            "tranco": tranco,
         },
+
+        # Debug-only flags for reviewers (not part of deterministic decision logic)
+        "reviewer_flags": {
+            "sender_etld1": _tranco_etld1(sender_domain) or None,
+            "mailed_by_etld1": _tranco_etld1(mailed_by) or None,
+            "signed_by_etld1": _tranco_etld1(signed_by) or None,
+            "mailed_by_etld1_match": bool(sender_domain and mailed_by and same_etld1(sender_domain, mailed_by)),
+            "signed_by_etld1_match": bool(sender_domain and signed_by and same_etld1(sender_domain, signed_by)),
+            "tranco_top_1m_present": tranco.get("tranco_present"),
+            "confidence_dampened_by_tranco": any("confidence slightly dampened" in (r or "").lower() for r in verdict_reasons),
+            "note": "Tranco is a legitimacy signal only; it never overrides other checks.",
+        },
+
 
         "server_decision": {
             "verdict": verdict,
@@ -1279,35 +1313,45 @@ def decide_verdict(
     if sender_domain:
         legitimacy += 1
 
-    if mailed_by and sender_domain and (mailed_by == sender_domain or mailed_by.endswith("." + sender_domain)):
+    if mailed_by and sender_domain and same_etld1(mailed_by, sender_domain):
         legitimacy += 1
-        reasons.append("Mailed-by matches sender domain (supporting signal).")
-    if signed_by and sender_domain and (signed_by == sender_domain or signed_by.endswith("." + sender_domain)):
+        reasons.append("Mailed-by matches sender domain at eTLD+1 (supporting signal).")
+    if signed_by and sender_domain and same_etld1(signed_by, sender_domain):
         legitimacy += 1
-        reasons.append("Signed-by matches sender domain (supporting signal).")
+        reasons.append("Signed-by matches sender domain at eTLD+1 (supporting signal).")
 
     strict_finance = (strictness or "").lower() == "strict_finance"
     low_noise = (strictness or "").lower() == "low_noise"
+
+    # Tranco Top 1M (Bloom): legitimacy signal only (never a trust override)
+    _tranco = tranco_legitimacy_signal(sender_domain)
+    tranco_present = _tranco.get("tranco_present")
+
+    def _final(verdict: Verdict, confidence: float) -> Tuple[Verdict, float, List[str]]:
+        new_conf, dampened = apply_tranco_confidence_dampener(str(verdict), float(confidence), tranco_present)
+        if dampened:
+            reasons.append("Sender domain appears in Tranco Top 1M (legitimacy signal; confidence slightly dampened).")
+        return verdict, new_conf, reasons
 
     if low_noise and moderate_flags > 0 and not payment_changed:
         moderate_flags = max(0, moderate_flags - 1)
 
     if strong_flags >= 2 or (strong_flags >= 1 and moderate_flags >= 2):
         confidence = 0.85 if strong_flags >= 2 else 0.75
-        return "HIGH RISK", confidence, reasons
+        return _final("HIGH RISK", confidence)
 
     if strong_flags == 0:
         if moderate_flags == 0:
-            return "SAFE", 0.82, reasons
+            return _final("SAFE", 0.82)
         if legitimacy >= 2 and not payment_changed:
-            return "SAFE", 0.72, reasons
+            return _final("SAFE", 0.72)
 
     base_conf = 0.62
     if payment_intent and moderate_flags > 0:
         base_conf = 0.60
     if strict_finance and payment_intent and strong_flags == 0:
         base_conf = min(base_conf, 0.58)
-    return "CAUTION", base_conf, reasons
+    return _final("CAUTION", base_conf)
 
 
 # -----------------------------
