@@ -1951,7 +1951,29 @@ def decide_verdict(
         ]
         return any(k in t for k in keywords)
 
+    def _payment_pressure_level(subj: str, snip: str) -> int:
+        """0 = none, 1 = billing-ish, 2 = threat/urgency billing."""
+        t = f"{subj or ''}\n{snip or ''}".lower()
+        threat = [
+            "account suspended", "account suspension", "account blocked", "blocked",
+            "your account will be", "we've blocked", "will be deleted", "deleted",
+            "action required", "immediately", "urgent", "final notice",
+            "expires today", "expires tomorrow", "avoid interruption",
+            "payment declined", "failed payment", "payment failed",
+            "update payment details", "update your payment",
+        ]
+        billing = [
+            "payment", "billing", "invoice", "renew", "renewal", "subscription",
+            "payment method", "card expired", "charge", "refund",
+        ]
+        if any(k in t for k in threat):
+            return 2
+        if any(k in t for k in billing):
+            return 1
+        return 0
+
     payment_request = bool(payment_intent) or _looks_like_payment_request(subject, redacted_snippet)
+    pressure_level = _payment_pressure_level(subject, redacted_snippet)
 
     # -----------------------------
     # Risk flags
