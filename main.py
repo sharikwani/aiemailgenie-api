@@ -46,13 +46,22 @@ app.add_middleware(
 )
 
 
-# ============================================================================
+# =============================================================================
 # Tranco Top 1M Bloom filter (legitimacy signal ONLY; never a trust override)
 # - Private repo safe: bloom is loaded from local artifacts/ at startup.
 # - Subdomain-safe: comparisons use eTLD+1 (organizational domain).
-# ============================================================================
+#
+# UPDATE (domain_overrides integration):
+# - If Worker domain_overrides says "deny" => treat as NOT legitimate.
+# - If "allow" => treat as legitimate.
+# - Else fallback to Bloom filter.
+# - Best-effort; never crashes the app if Worker is unreachable.
+# =============================================================================
 TRANCO_BLOOM_PATH = os.path.join("artifacts", "tranco.bloom")
 _tranco_extractor = tldextract.TLDExtract(cache_dir=False)
+
+# Domain override cache (best-effort, low-risk performance optimization)
+DOMAIN_OVERRIDE_CACHE_TTL_SECONDS = int(os.environ.get("DOMAIN_OVERRIDE_CACHE_TTL_SECONDS", "600").strip() or "600")
 
 def etld1(host: str) -> str:
     host = (host or "").strip().lower().rstrip(".")
@@ -62,6 +71,11 @@ def etld1(host: str) -> str:
     if not r.domain or not r.suffix:
         return ""
     return f"{r.domain}.{r.suffix}"
+
+def safe_clean_domain(d: str) -> str:
+    d = (d or "").strip().lower()
+    d = re.sub(r"[^a-z0-9.\-]", "", d)
+    return d[:200]
 
 def same_etld1(a: str, b: str) -> bool:
     a = safe_clean_domain(a)
@@ -83,20 +97,180 @@ def _load_tranco_bloom_best_effort():
 def _startup_load_tranco_bloom():
     # Best-effort: never crash the app if the file is missing.
     app.state.tranco_bloom = _load_tranco_bloom_best_effort()
+    # Best-effort cache for Worker domain_overrides
+    app.state.domain_override_cache = {}
+
+def _cache_get_domain_override(etld1_value: str) -> Optional[str]:
+    """
+    Returns "allow" / "deny" / None.
+    """
+    try:
+        cache = getattr(app.state, "domain_override_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        item = cache.get(etld1_value)
+        if not item:
+            return None
+        action, expires_at = item
+        if not action:
+            return None
+        if isinstance(expires_at, (int, float)) and expires_at < int(datetime.now(timezone.utc).timestamp()):
+            # expired
+            cache.pop(etld1_value, None)
+            return None
+        if action in ("allow", "deny"):
+            return action
+        return None
+    except Exception:
+        return None
+
+def _cache_set_domain_override(etld1_value: str, action: Optional[str]) -> None:
+    try:
+        cache = getattr(app.state, "domain_override_cache", None)
+        if not isinstance(cache, dict):
+            return
+        exp = int(datetime.now(timezone.utc).timestamp()) + max(30, int(DOMAIN_OVERRIDE_CACHE_TTL_SECONDS))
+        # Store explicit None as "" to avoid ambiguity (but still cacheable as "no override")
+        stored_action = action if action in ("allow", "deny") else ""
+        cache[etld1_value] = (stored_action, exp)
+    except Exception:
+        return
+
+def _worker_domain_override_best_effort(etld1_value: str) -> Optional[str]:
+    """
+    Best-effort lookup:
+      GET /admin/domain-override?etld1=...
+    Expected outcomes:
+      - If exists: returns dict containing an action ("allow"/"deny") (field name may vary)
+      - If not exists: may return ok:false or empty; treat as None
+    Never raises; returns "allow", "deny", or None.
+    """
+    etld1_value = (etld1_value or "").strip().lower()
+    if not etld1_value:
+        return None
+
+    # Cache first
+    cached = _cache_get_domain_override(etld1_value)
+    if cached in ("allow", "deny"):
+        return cached
+    # If cached as "no override" we store as empty string; _cache_get_domain_override returns None.
+    # We still might want to avoid hammering; we will proceed and then cache result anyway.
+
+    # If DB is not configured, skip overrides entirely
+    db_url = (os.environ.get("DB_API_URL", "") or "").strip().rstrip("/")
+    db_key = (os.environ.get("DB_API_KEY", "") or "").strip()
+    if not db_url or not db_key:
+        return None
+
+    url = f"{db_url}/admin/domain-override?etld1={requests.utils.quote(etld1_value)}"
+    try:
+        r = requests.get(url, headers={"X-DB-KEY": db_key}, timeout=10)
+        if r.status_code >= 400:
+            # Cache "no override" briefly to reduce repeat calls on 404/401/etc.
+            _cache_set_domain_override(etld1_value, None)
+            return None
+
+        data = r.json() if r.content else {}
+        if not isinstance(data, dict):
+            _cache_set_domain_override(etld1_value, None)
+            return None
+
+        # Try common shapes
+        # Examples we tolerate:
+        # { "ok": true, "override": {"action":"deny"} }
+        # { "action":"deny" }
+        # { "override_action":"deny" }
+        action = None
+        if isinstance(data.get("action"), str):
+            action = data.get("action")
+        elif isinstance(data.get("override_action"), str):
+            action = data.get("override_action")
+        else:
+            ov = data.get("override")
+            if isinstance(ov, dict) and isinstance(ov.get("action"), str):
+                action = ov.get("action")
+
+        action = (action or "").strip().lower()
+        if action in ("allow", "deny"):
+            _cache_set_domain_override(etld1_value, action)
+            return action
+
+        # No override found
+        _cache_set_domain_override(etld1_value, None)
+        return None
+
+    except Exception:
+        # Do not cache errors as "no override" (so transient issues can recover),
+        # but also do not raise.
+        return None
 
 def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
+    """
+    Returns:
+      - tranco_present: effective legitimacy boolean or None
+      - tranco_base: eTLD+1
+      - reason: "override_allow" | "override_deny" | "ok" | "bloom_unavailable" | "bloom_error" | "invalid_domain"
+      - override_action: "allow" | "deny" | None
+      - tranco_present_raw: raw bloom presence boolean or None (when available)
+    """
     base = etld1(domain)
     bloom = getattr(app.state, "tranco_bloom", None)
 
     if not base:
-        return {"tranco_present": None, "tranco_base": None, "reason": "invalid_domain"}
+        return {
+            "tranco_present": None,
+            "tranco_base": None,
+            "reason": "invalid_domain",
+            "override_action": None,
+            "tranco_present_raw": None,
+        }
+
+    # 1) Worker domain override takes precedence (best-effort)
+    override_action = _worker_domain_override_best_effort(base)
+    if override_action == "allow":
+        return {
+            "tranco_present": True,
+            "tranco_base": base,
+            "reason": "override_allow",
+            "override_action": "allow",
+            "tranco_present_raw": (base in bloom) if bloom is not None else None,
+        }
+    if override_action == "deny":
+        return {
+            "tranco_present": False,
+            "tranco_base": base,
+            "reason": "override_deny",
+            "override_action": "deny",
+            "tranco_present_raw": (base in bloom) if bloom is not None else None,
+        }
+
+    # 2) Fallback to bloom filter
     if bloom is None:
-        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_unavailable"}
+        return {
+            "tranco_present": None,
+            "tranco_base": base,
+            "reason": "bloom_unavailable",
+            "override_action": None,
+            "tranco_present_raw": None,
+        }
 
     try:
-        return {"tranco_present": (base in bloom), "tranco_base": base, "reason": "ok"}
+        raw = (base in bloom)
+        return {
+            "tranco_present": raw,
+            "tranco_base": base,
+            "reason": "ok",
+            "override_action": None,
+            "tranco_present_raw": raw,
+        }
     except Exception:
-        return {"tranco_present": None, "tranco_base": base, "reason": "bloom_error"}
+        return {
+            "tranco_present": None,
+            "tranco_base": base,
+            "reason": "bloom_error",
+            "override_action": None,
+            "tranco_present_raw": None,
+        }
 
 def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_present: Optional[bool]) -> Tuple[float, bool]:
     """If Tranco indicates a widely-used domain, slightly dampen confidence for risky verdicts.
@@ -671,12 +845,6 @@ def cron_license_reminders_run(request: Request):
 # -----------------------------
 # Helpers (privacy, parsing)
 # -----------------------------
-def safe_clean_domain(d: str) -> str:
-    d = (d or "").strip().lower()
-    d = re.sub(r"[^a-z0-9.\-]", "", d)
-    return d[:200]
-
-
 def redact_text(t: str) -> str:
     if not t:
         return ""
@@ -1075,8 +1243,7 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         strictness=req.strictness,
     )
 
-
-    # Tranco legitimacy signal (heuristic only)
+    # Tranco legitimacy signal (heuristic only) with domain_overrides
     tranco = tranco_legitimacy_signal(sender_domain)
 
     # Reviewer/debug flags (internal). Safe defaults so this never crashes.
@@ -1087,14 +1254,15 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "mailed_by_etld1_match": bool(sender_domain and mailed_by and same_etld1(sender_domain, mailed_by)),
         "signed_by_etld1_match": bool(sender_domain and signed_by and same_etld1(sender_domain, signed_by)),
         "tranco_top_1m_present": bool(tranco.get("tranco_present") is True),
+        "tranco_override_action": tranco.get("override_action"),
+        "tranco_present_raw": tranco.get("tranco_present_raw"),
         "confidence_dampened_by_tranco": False,
-        "note": "Tranco is a legitimacy signal only; it does not override other checks."
+        "note": "Tranco is a legitimacy signal only; it does not override other checks.",
     }
 
     # Confidence calibration (verdict unchanged)
     conf, dampened = apply_tranco_confidence_dampener(verdict, float(conf), tranco.get("tranco_present"))
     reviewer_flags["confidence_dampened_by_tranco"] = bool(dampened)
-
 
     ctx = {
         "provider": (req.provider or "")[:30],
@@ -1386,7 +1554,7 @@ def ai_chat(req: ChatRequest):
         messages.append({"role": h.role, "content": (h.content or "")[:2000]})
 
     if is_followup:
-        messages.append({"role": "user", "content": f"EMAIL_CONTEXT_JSON:\n{context}\n\nUser question: {req.userMessage.strip()[:2000]}"})
+        messages.append({"role": "user", "content": f"EMAIL_CONTEXT_JSON:\n{context}\n\nUser question: {req.userMessage.strip()[:2000]}"} )
     else:
         messages.append({"role": "user", "content": f"EMAIL_CONTEXT_JSON:\n{context}\n\nGenerate the initial briefing in the required format."})
 
