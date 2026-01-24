@@ -5,14 +5,14 @@ from typing import List, Optional, Dict, Any, Literal, Tuple
 
 import json
 
-import tldextract
-from pybloom_live import BloomFilter
-
 import requests
 import stripe
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+import tldextract
+from pybloom_live import BloomFilter
 
 from openai import OpenAI
 
@@ -32,13 +32,6 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
 app = FastAPI(title="AI Mail Genie AI API", version="3.3.1")
 
-# Tranco Bloom: load once on boot (best-effort; never crash app)
-app.state.tranco_bloom = None
-
-@app.on_event("startup")
-def _startup_load_tranco_bloom():
-    app.state.tranco_bloom = _load_tranco_bloom_best_effort()
-
 # 🔴 REQUIRED FOR RENDER HEALTH CHECK 🔴
 @app.get("/")
 def root():
@@ -52,21 +45,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Tranco Bloom legitimacy signal (best-effort; NOT a trust override)
-# -----------------------------
-TRANCO_BLOOM_PATH = os.path.join("artifacts", "tranco.bloom")
 
+# ============================================================================
+# Tranco Top 1M Bloom filter (legitimacy signal ONLY; never a trust override)
+# - Private repo safe: bloom is loaded from local artifacts/ at startup.
+# - Subdomain-safe: comparisons use eTLD+1 (organizational domain).
+# ============================================================================
+TRANCO_BLOOM_PATH = os.path.join("artifacts", "tranco.bloom")
 _tranco_extractor = tldextract.TLDExtract(cache_dir=False)
 
-
-def _tranco_etld1(host: str) -> str:
-    """
-    Subdomain-safe normalization: returns eTLD+1, or "" if invalid.
-    Examples:
-      - accounts.google.com -> google.com
-      - mail.example.co.uk -> example.co.uk
-    """
+def etld1(host: str) -> str:
     host = (host or "").strip().lower().rstrip(".")
     if not host:
         return ""
@@ -75,12 +63,14 @@ def _tranco_etld1(host: str) -> str:
         return ""
     return f"{r.domain}.{r.suffix}"
 
+def same_etld1(a: str, b: str) -> bool:
+    a = safe_clean_domain(a)
+    b = safe_clean_domain(b)
+    if not a or not b:
+        return False
+    return etld1(a) == etld1(b)
 
-def _load_tranco_bloom_best_effort() -> "BloomFilter | None":
-    """
-    Loads artifacts/tranco.bloom if present.
-    Never raises; returns None on any failure.
-    """
+def _load_tranco_bloom_best_effort():
     try:
         if not os.path.exists(TRANCO_BLOOM_PATH):
             return None
@@ -89,15 +79,13 @@ def _load_tranco_bloom_best_effort() -> "BloomFilter | None":
     except Exception:
         return None
 
+@app.on_event("startup")
+def _startup_load_tranco_bloom():
+    # Best-effort: never crash the app if the file is missing.
+    app.state.tranco_bloom = _load_tranco_bloom_best_effort()
 
 def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
-    """
-    Returns a lightweight signal object.
-    - tranco_present is None if bloom isn't loaded or domain invalid.
-    - tranco_present True/False otherwise.
-    This is ONLY a legitimacy signal; it must not override verdict logic.
-    """
-    base = _tranco_etld1(domain)
+    base = etld1(domain)
     bloom = getattr(app.state, "tranco_bloom", None)
 
     if not base:
@@ -110,22 +98,11 @@ def tranco_legitimacy_signal(domain: str) -> Dict[str, Any]:
     except Exception:
         return {"tranco_present": None, "tranco_base": base, "reason": "bloom_error"}
 
-
-
-
-def same_etld1(a: str, b: str) -> bool:
-    """True if both domains share the same eTLD+1 (organizational domain)."""
-    a_base = _tranco_etld1(a)
-    b_base = _tranco_etld1(b)
-    return bool(a_base) and (a_base == b_base)
-
-
-def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_present: Any) -> Tuple[float, bool]:
+def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_present: Optional[bool]) -> Tuple[float, bool]:
+    """If Tranco indicates a widely-used domain, slightly dampen confidence for risky verdicts.
+    Verdict is not changed; this is only calibration.
     """
-    If the sender domain appears in Tranco Top 1M, slightly dampen confidence for risky verdicts.
-    This does NOT change the verdict (signal only).
-    """
-    if tranco_present is True and verdict in {"HIGH RISK", "CAUTION"}:
+    if tranco_present is True and verdict in ("CAUTION", "HIGH RISK") and isinstance(confidence, (int, float)):
         new_conf = max(0.55, float(confidence) - 0.08)
         return new_conf, (new_conf != float(confidence))
     return float(confidence), False
@@ -560,8 +537,6 @@ async def stripe_webhook(request: Request):
             plan_name=plan_payload.get("label") or "AI Mail Genie Pro",
             session_id=session_id,
         )
-
-    tranco = tranco_legitimacy_signal(sender_domain)
 
     return {"ok": True, "fulfilled": True, "license": created}
 
@@ -1100,6 +1075,27 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         strictness=req.strictness,
     )
 
+
+    # Tranco legitimacy signal (heuristic only)
+    tranco = tranco_legitimacy_signal(sender_domain)
+
+    # Reviewer/debug flags (internal). Safe defaults so this never crashes.
+    reviewer_flags: Dict[str, Any] = {
+        "sender_etld1": etld1(sender_domain) if sender_domain else "",
+        "mailed_by_etld1": etld1(mailed_by) if mailed_by else "",
+        "signed_by_etld1": etld1(signed_by) if signed_by else "",
+        "mailed_by_etld1_match": bool(sender_domain and mailed_by and same_etld1(sender_domain, mailed_by)),
+        "signed_by_etld1_match": bool(sender_domain and signed_by and same_etld1(sender_domain, signed_by)),
+        "tranco_top_1m_present": bool(tranco.get("tranco_present") is True),
+        "confidence_dampened_by_tranco": False,
+        "note": "Tranco is a legitimacy signal only; it does not override other checks."
+    }
+
+    # Confidence calibration (verdict unchanged)
+    conf, dampened = apply_tranco_confidence_dampener(verdict, float(conf), tranco.get("tranco_present"))
+    reviewer_flags["confidence_dampened_by_tranco"] = bool(dampened)
+
+
     ctx = {
         "provider": (req.provider or "")[:30],
         "thread_key": (req.threadKey or "")[:260],
@@ -1124,22 +1120,8 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
         "computed_link_signals": link_signals,
 
-        "legitimacy_signals": {
-            "tranco": tranco,
-        },
-
-        # Debug-only flags for reviewers (not part of deterministic decision logic)
-        "reviewer_flags": {
-            "sender_etld1": _tranco_etld1(sender_domain) or None,
-            "mailed_by_etld1": _tranco_etld1(mailed_by) or None,
-            "signed_by_etld1": _tranco_etld1(signed_by) or None,
-            "mailed_by_etld1_match": bool(sender_domain and mailed_by and same_etld1(sender_domain, mailed_by)),
-            "signed_by_etld1_match": bool(sender_domain and signed_by and same_etld1(sender_domain, signed_by)),
-            "tranco_top_1m_present": tranco.get("tranco_present"),
-            "confidence_dampened_by_tranco": any("confidence slightly dampened" in (r or "").lower() for r in verdict_reasons),
-            "note": "Tranco is a legitimacy signal only; it never overrides other checks.",
-        },
-
+        "legitimacy_signals": {"tranco": tranco},
+        "reviewer_flags": reviewer_flags,
 
         "server_decision": {
             "verdict": verdict,
@@ -1315,43 +1297,33 @@ def decide_verdict(
 
     if mailed_by and sender_domain and same_etld1(mailed_by, sender_domain):
         legitimacy += 1
-        reasons.append("Mailed-by matches sender domain at eTLD+1 (supporting signal).")
+        reasons.append("Mailed-by matches sender org domain (eTLD+1) (supporting signal).")
     if signed_by and sender_domain and same_etld1(signed_by, sender_domain):
         legitimacy += 1
-        reasons.append("Signed-by matches sender domain at eTLD+1 (supporting signal).")
+        reasons.append("Signed-by matches sender org domain (eTLD+1) (supporting signal).")
 
     strict_finance = (strictness or "").lower() == "strict_finance"
     low_noise = (strictness or "").lower() == "low_noise"
-
-    # Tranco Top 1M (Bloom): legitimacy signal only (never a trust override)
-    _tranco = tranco_legitimacy_signal(sender_domain)
-    tranco_present = _tranco.get("tranco_present")
-
-    def _final(verdict: Verdict, confidence: float) -> Tuple[Verdict, float, List[str]]:
-        new_conf, dampened = apply_tranco_confidence_dampener(str(verdict), float(confidence), tranco_present)
-        if dampened:
-            reasons.append("Sender domain appears in Tranco Top 1M (legitimacy signal; confidence slightly dampened).")
-        return verdict, new_conf, reasons
 
     if low_noise and moderate_flags > 0 and not payment_changed:
         moderate_flags = max(0, moderate_flags - 1)
 
     if strong_flags >= 2 or (strong_flags >= 1 and moderate_flags >= 2):
         confidence = 0.85 if strong_flags >= 2 else 0.75
-        return _final("HIGH RISK", confidence)
+        return "HIGH RISK", confidence, reasons
 
     if strong_flags == 0:
         if moderate_flags == 0:
-            return _final("SAFE", 0.82)
+            return "SAFE", 0.82, reasons
         if legitimacy >= 2 and not payment_changed:
-            return _final("SAFE", 0.72)
+            return "SAFE", 0.72, reasons
 
     base_conf = 0.62
     if payment_intent and moderate_flags > 0:
         base_conf = 0.60
     if strict_finance and payment_intent and strong_flags == 0:
         base_conf = min(base_conf, 0.58)
-    return _final("CAUTION", base_conf)
+    return "CAUTION", base_conf, reasons
 
 
 # -----------------------------
