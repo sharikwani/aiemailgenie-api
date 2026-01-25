@@ -279,6 +279,32 @@ def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_pre
     return float(confidence), False
 
 
+def risk_score_from_verdict(verdict: str, confidence: float) -> int:
+    """Canonical 0..100 risk score for UI rendering.
+    - SAFE: 0..30 (lower is safer)
+    - CAUTION: 31..70
+    - HIGH RISK: 71..100
+    Confidence is interpreted as the server's confidence in the verdict.
+    """
+    v = (verdict or "").strip().upper()
+    try:
+        c = float(confidence)
+    except Exception:
+        c = 0.5
+    c = max(0.0, min(1.0, c))
+
+    if v == "SAFE":
+        # High confidence SAFE => near 0 risk
+        score = int(round((1.0 - c) * 30.0))
+    elif v == "HIGH RISK":
+        score = int(round(71.0 + (c * 29.0)))
+    else:
+        # CAUTION (or unknown)
+        score = int(round(31.0 + (c * 39.0)))
+
+    return max(0, min(100, score))
+
+
 # -----------------------------
 # Cloudflare Worker DB API (D1 Gateway)
 # -----------------------------
@@ -1571,6 +1597,13 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
+    # UI-alignment fields (optional; backward-compatible for older extensions)
+    # NOTE: these fields intentionally avoid naming internal data sources.
+    server_decision: Optional[Dict[str, Any]] = None
+    risk_score: Optional[int] = None  # 0..100 (higher = riskier)
+    signals: Optional[Dict[str, Any]] = None
+
+
 
 def upgrade_required_reply() -> str:
     return (
@@ -2170,6 +2203,40 @@ def ai_chat(req: ChatRequest):
         if mode == "pro":
             usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
 
-        return ChatResponse(reply=reply)
+        decision = context.get("server_decision") if isinstance(context, dict) else None
+        verdict = (decision or {}).get("verdict") if isinstance(decision, dict) else ""
+        conf = (decision or {}).get("confidence") if isinstance(decision, dict) else None
+
+        # Signals for the extension UI (do not expose internal source names)
+        reviewer_flags = (context.get("reviewer_flags") or {}) if isinstance(context, dict) else {}
+        tranco = ((context.get("legitimacy_signals") or {}).get("tranco") or {}) if isinstance(context, dict) else {}
+
+        sender_popular = reviewer_flags.get("tranco_top_1m_present")
+        # Normalize to True/False/None
+        if sender_popular is not True and sender_popular is not False:
+            sender_popular = None
+
+        signals = {
+            "sender_org_domain": (context.get("sender_domain_etld1") or "") if isinstance(context, dict) else "",
+            "sender_domain_popular": sender_popular,
+            # allow the UI to explain overrides without referencing internal lists
+            "sender_domain_override": tranco.get("override_action") if isinstance(tranco, dict) else None,
+            "mailed_by_matches_sender_org": reviewer_flags.get("mailed_by_etld1_match"),
+            "signed_by_matches_sender_org": reviewer_flags.get("signed_by_etld1_match"),
+        }
+
+        risk_score = None
+        try:
+            if verdict and isinstance(conf, (int, float)):
+                risk_score = risk_score_from_verdict(str(verdict), float(conf))
+        except Exception:
+            risk_score = None
+
+        return ChatResponse(
+            reply=reply,
+            server_decision=decision if isinstance(decision, dict) else None,
+            risk_score=risk_score,
+            signals=signals
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI chat failed: {str(e)}")
