@@ -2225,6 +2225,25 @@ def ai_chat(req: ChatRequest):
             "signed_by_matches_sender_org": reviewer_flags.get("signed_by_etld1_match"),
         }
 
+        # Link-domain popularity (helps reduce false positives for reputable ESP/link-tracking domains)
+        link_domains_popularity = []
+        try:
+            for ld in list(dict.fromkeys(req.linkDomains or []))[:20]:
+                t = tranco_legitimacy_signal(ld)
+                # Normalize to True/False/None
+                popular = t.get("tranco_present")
+                if popular is not True and popular is not False:
+                    popular = None
+                link_domains_popularity.append({
+                    "domain": t.get("tranco_base") or etld1(ld) or ld,
+                    "popular": popular,
+                    "reason": t.get("reason")
+                })
+        except Exception:
+            link_domains_popularity = []
+
+        signals["link_domains_popularity"] = link_domains_popularity
+
         risk_score = None
         try:
             if verdict and isinstance(conf, (int, float)):
