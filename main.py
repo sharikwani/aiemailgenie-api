@@ -82,6 +82,95 @@ def safe_clean_domain(d: str) -> str:
     d = re.sub(r"[^a-z0-9.\-]", "", d)
     return d[:200]
 
+def normalize_email(value: str) -> str:
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    m = re.search(r"<([^>]+)>", v)
+    if m:
+        v = (m.group(1) or "").strip().lower()
+    v = re.sub(r"[^a-z0-9@._+\-]", "", v)
+    return v[:260]
+
+
+def _kb_cache_get() -> Optional[Dict[str, Any]]:
+    try:
+        cache = getattr(app.state, "known_bad_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        exp = cache.get("exp", 0)
+        if exp and exp > int(datetime.now(timezone.utc).timestamp()):
+            return cache.get("data")
+        return None
+    except Exception:
+        return None
+
+
+def _kb_cache_set(data: Dict[str, Any]) -> None:
+    try:
+        ttl = max(30, int(KNOWN_BAD_CACHE_TTL_SECONDS))
+        app.state.known_bad_cache = {
+            "data": data,
+            "exp": int(datetime.now(timezone.utc).timestamp()) + ttl,
+            "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception:
+        return
+
+
+def load_known_bad_best_effort() -> Dict[str, Any]:
+    cached = _kb_cache_get()
+    if cached is not None:
+        return cached
+
+    empty = {"version": 0, "updated_at": "", "emails": [], "domains": []}
+
+    if not KNOWN_BAD_URL:
+        _kb_cache_set(empty)
+        return empty
+
+    try:
+        r = requests.get(KNOWN_BAD_URL, timeout=12)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+
+        emails_raw = data.get("emails") or []
+        domains_raw = data.get("domains") or []
+
+        emails = sorted({normalize_email(x) for x in emails_raw if isinstance(x, str) and x.strip()})
+        domains = sorted({safe_clean_domain(x) for x in domains_raw if isinstance(x, str) and x.strip()})
+
+        out = {
+            "version": int(data.get("version") or 1),
+            "updated_at": str(data.get("updated_at") or ""),
+            "emails": emails,
+            "domains": domains,
+        }
+        _kb_cache_set(out)
+        return out
+    except Exception:
+        _kb_cache_set(empty)
+        return empty
+
+
+def known_bad_lookup(sender_email: str, sender_domain: str) -> Dict[str, Any]:
+    kb = load_known_bad_best_effort()
+    emails = set(kb.get("emails") or [])
+    domains = set(kb.get("domains") or [])
+
+    se = normalize_email(sender_email)
+    sd = safe_clean_domain(sender_domain)
+    base = etld1(sd) if sd else ""
+
+    if se and se in emails:
+        return {"hit": True, "type": "email", "value": se, "reason": "Sender email is in known-bad list.", "meta": kb}
+
+    if sd and (sd in domains or (base and base in domains)):
+        return {"hit": True, "type": "domain", "value": sd if sd in domains else base, "reason": "Sender domain is in known-bad list.", "meta": kb}
+
+    return {"hit": False, "type": "", "value": "", "reason": "", "meta": kb}
+
+
 
 def same_etld1(a: str, b: str) -> bool:
     a = safe_clean_domain(a)
@@ -284,6 +373,13 @@ def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_pre
 # -----------------------------
 DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
 DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
+
+# -----------------------------
+# Known-bad threatlist (email + domain) from GitHub RAW
+# -----------------------------
+KNOWN_BAD_URL = (os.environ.get("KNOWN_BAD_URL", "") or "").strip()
+KNOWN_BAD_CACHE_TTL_SECONDS = int((os.environ.get("KNOWN_BAD_CACHE_TTL_SECONDS", "900") or "900").strip())
+
 
 # -----------------------------
 # Render-side Admin Proxy (Security Hardening)
@@ -1740,7 +1836,14 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
     # Tranco legitimacy signal (heuristic only) with domain_overrides
     tranco = tranco_legitimacy_signal(sender_domain)
 
-    verdict, conf, verdict_reasons = decide_verdict(
+# Known-bad (hard denylist) must override everything (including Gmail verified + Tranco)
+kb_hit = known_bad_lookup(req.senderEmail, sender_domain)
+if kb_hit.get("hit") is True:
+    verdict = "HIGH RISK"
+    conf = 0.99
+    verdict_reasons = [kb_hit.get("reason") or "Matched known-bad list."]
+else:
+        verdict, conf, verdict_reasons = decide_verdict(
         sender_domain=sender_domain,
         mailed_by=mailed_by,
         signed_by=signed_by,
@@ -1752,7 +1855,7 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         redacted_snippet=req.redactedSnippet,
         gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
         tranco_present=bool(tranco.get('tranco_present') is True),
-    )
+        )
 
     reviewer_flags: Dict[str, Any] = {
         "sender_etld1": etld1(sender_domain) if sender_domain else "",
@@ -1764,6 +1867,11 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "tranco_override_action": tranco.get("override_action"),
         "tranco_present_raw": tranco.get("tranco_present_raw"),
         "confidence_dampened_by_tranco": False,
+        "known_bad_hit": bool(kb_hit.get("hit") is True) if isinstance(kb_hit, dict) else False,
+        "known_bad_type": kb_hit.get("type") if isinstance(kb_hit, dict) else "",
+        "known_bad_value": kb_hit.get("value") if isinstance(kb_hit, dict) else "",
+        "known_bad_updated_at": (kb_hit.get("meta") or {}).get("updated_at", "") if isinstance(kb_hit, dict) else "",
+
         "note": "Tranco is a legitimacy signal only; it does not override other checks.",
     }
 
@@ -2050,32 +2158,6 @@ def decide_verdict(
 
     if low_noise and moderate_flags > 0 and not payment_changed:
         moderate_flags = max(0, moderate_flags - 1)
-
-    # ---------------------------------------------------------------------
-    # Gmail Verified Sender (blue check) handling
-    # ---------------------------------------------------------------------
-    # The extension provides gmail_verified=True when Gmail shows a "Verified sender" badge.
-    # Per product requirement, we treat this as an identity-verified sender and bias strongly
-    # toward SAFE. When combined with Tranco presence, we treat this as fully safe.
-    # We still record other minor indicators in reasons, but do not escalate the verdict.
-    if gmail_verified:
-        # Minor adjustments: keep SAFE but slightly lower confidence if there are clear
-        # high-risk local signals (e.g., payment-change or highly suspicious links).
-        if tranco_present is True:
-            reasons.append("Verified sender badge + widely used org domain (treated as fully verified).")
-            return "SAFE", 1.00, reasons
-
-        conf = 0.98
-        if strong_flags > 0:
-            conf = max(0.85, conf - (0.08 * float(strong_flags)))
-        if moderate_flags > 0:
-            conf = max(0.85, conf - (0.04 * float(moderate_flags)))
-        if payment_request:
-            # Payment requests can still be risky even from a verified sender; keep SAFE but nudge confidence.
-            conf = max(0.85, conf - 0.06)
-
-        reasons.append("Verified sender badge detected (identity verified by provider).")
-        return "SAFE", float(conf), reasons
 
     # -----------------------------
     # NEW: stronger payment-request escalation
