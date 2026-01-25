@@ -2051,6 +2051,32 @@ def decide_verdict(
     if low_noise and moderate_flags > 0 and not payment_changed:
         moderate_flags = max(0, moderate_flags - 1)
 
+    # ---------------------------------------------------------------------
+    # Gmail Verified Sender (blue check) handling
+    # ---------------------------------------------------------------------
+    # The extension provides gmail_verified=True when Gmail shows a "Verified sender" badge.
+    # Per product requirement, we treat this as an identity-verified sender and bias strongly
+    # toward SAFE. When combined with Tranco presence, we treat this as fully safe.
+    # We still record other minor indicators in reasons, but do not escalate the verdict.
+    if gmail_verified:
+        # Minor adjustments: keep SAFE but slightly lower confidence if there are clear
+        # high-risk local signals (e.g., payment-change or highly suspicious links).
+        if tranco_present is True:
+            reasons.append("Verified sender badge + widely used org domain (treated as fully verified).")
+            return "SAFE", 1.00, reasons
+
+        conf = 0.98
+        if strong_flags > 0:
+            conf = max(0.85, conf - (0.08 * float(strong_flags)))
+        if moderate_flags > 0:
+            conf = max(0.85, conf - (0.04 * float(moderate_flags)))
+        if payment_request:
+            # Payment requests can still be risky even from a verified sender; keep SAFE but nudge confidence.
+            conf = max(0.85, conf - 0.06)
+
+        reasons.append("Verified sender badge detected (identity verified by provider).")
+        return "SAFE", float(conf), reasons
+
     # -----------------------------
     # NEW: stronger payment-request escalation
     # -----------------------------
