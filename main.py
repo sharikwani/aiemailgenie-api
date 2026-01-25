@@ -379,7 +379,7 @@ DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 # Known-bad threatlist (email + domain) from GitHub RAW
 # -----------------------------
 KNOWN_BAD_URL = (os.environ.get("KNOWN_BAD_URL", "") or "").strip()
-KNOWN_BAD_CACHE_TTL_SECONDS = int((os.environ.get("KNOWN_BAD_CACHE_TTL_SECONDS", "900") or "900").strip())
+KNOWN_BAD_CACHE_TTL_SECONDS = int((os.environ.get("KNOWN_BAD_CACHE_TTL_SECONDS", "30") or "300").strip())
 
 
 # -----------------------------
