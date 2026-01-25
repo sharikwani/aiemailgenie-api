@@ -196,6 +196,7 @@ def _startup_load_tranco_bloom():
     app.state.tranco_bloom = _load_tranco_bloom_best_effort()
     # Best-effort cache for Worker domain_overrides
     app.state.domain_override_cache = {}
+    app.state.known_bad_cache = {}
 
 
 def _cache_get_domain_override(etld1_value: str) -> Optional[str]:
@@ -1835,29 +1836,28 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
     # Tranco legitimacy signal (heuristic only) with domain_overrides
     tranco = tranco_legitimacy_signal(sender_domain)
-
-    # Known-bad (hard denylist) lookup (hard override applied after deterministic checks)
+    # Known-bad threatlist override (FIRST PRIORITY)
     kb_hit = known_bad_lookup(req.senderEmail, sender_domain)
-    verdict, conf, verdict_reasons = decide_verdict(
-        sender_domain=sender_domain,
-        mailed_by=mailed_by,
-        signed_by=signed_by,
-        payment_changed=bool(req.paymentChanged),
-        payment_intent=bool(req.paymentIntent),
-        link_signals=link_signals,
-        strictness=req.strictness,
-        subject=req.subject,
-        redacted_snippet=req.redactedSnippet,
-        gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
-        tranco_present=bool(tranco.get('tranco_present') is True),
-    )
 
 
-    # Hard override: known-bad always forces HIGH RISK
-    if isinstance(kb_hit, dict) and kb_hit.get('hit') is True:
-        verdict = 'HIGH RISK'
+    if kb_hit.get("hit") is True:
+        verdict = "HIGH RISK"
         conf = 0.99
-        verdict_reasons = [kb_hit.get('reason') or 'Matched known-bad list.']
+        verdict_reasons = [kb_hit.get("reason") or "Matched known-bad list."]
+    else:
+            verdict, conf, verdict_reasons = decide_verdict(
+                sender_domain=sender_domain,
+                mailed_by=mailed_by,
+                signed_by=signed_by,
+                payment_changed=bool(req.paymentChanged),
+                payment_intent=bool(req.paymentIntent),
+                link_signals=link_signals,
+                strictness=req.strictness,
+                subject=req.subject,
+                redacted_snippet=req.redactedSnippet,
+                gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
+                tranco_present=bool(tranco.get('tranco_present') is True),
+            )
 
     reviewer_flags: Dict[str, Any] = {
         "sender_etld1": etld1(sender_domain) if sender_domain else "",
@@ -1869,15 +1869,17 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "tranco_override_action": tranco.get("override_action"),
         "tranco_present_raw": tranco.get("tranco_present_raw"),
         "confidence_dampened_by_tranco": False,
-        "known_bad_hit": bool(kb_hit.get("hit") is True) if isinstance(kb_hit, dict) else False,
-        "known_bad_type": kb_hit.get("type") if isinstance(kb_hit, dict) else "",
-        "known_bad_value": kb_hit.get("value") if isinstance(kb_hit, dict) else "",
-        "known_bad_updated_at": (kb_hit.get("meta") or {}).get("updated_at", "") if isinstance(kb_hit, dict) else "",
-
+        "known_bad_hit": bool(kb_hit.get("hit") is True),
+        "known_bad_type": kb_hit.get("type") or "",
+        "known_bad_value": kb_hit.get("value") or "",
+        "known_bad_updated_at": (kb_hit.get("meta") or {}).get("updated_at", ""),
         "note": "Tranco is a legitimacy signal only; it does not override other checks.",
     }
 
-    conf, dampened = apply_tranco_confidence_dampener(verdict, float(conf), tranco.get("tranco_present"))
+    if kb_hit.get("hit") is True:
+        dampened = False
+    else:
+        conf, dampened = apply_tranco_confidence_dampener(verdict, float(conf), tranco.get("tranco_present"))
     reviewer_flags["confidence_dampened_by_tranco"] = bool(dampened)
 
     ctx = {
