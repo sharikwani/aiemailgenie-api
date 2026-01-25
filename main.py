@@ -279,32 +279,6 @@ def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_pre
     return float(confidence), False
 
 
-def risk_score_from_verdict(verdict: str, confidence: float) -> int:
-    """Canonical 0..100 risk score for UI rendering.
-    - SAFE: 0..30 (lower is safer)
-    - CAUTION: 31..70
-    - HIGH RISK: 71..100
-    Confidence is interpreted as the server's confidence in the verdict.
-    """
-    v = (verdict or "").strip().upper()
-    try:
-        c = float(confidence)
-    except Exception:
-        c = 0.5
-    c = max(0.0, min(1.0, c))
-
-    if v == "SAFE":
-        # High confidence SAFE => near 0 risk
-        score = int(round((1.0 - c) * 30.0))
-    elif v == "HIGH RISK":
-        score = int(round(71.0 + (c * 29.0)))
-    else:
-        # CAUTION (or unknown)
-        score = int(round(31.0 + (c * 39.0)))
-
-    return max(0, min(100, score))
-
-
 # -----------------------------
 # Cloudflare Worker DB API (D1 Gateway)
 # -----------------------------
@@ -1572,6 +1546,9 @@ class ChatRequest(BaseModel):
     mailedBy: str = Field(default="", max_length=200)
     signedBy: str = Field(default="", max_length=200)
 
+    # Gmail UI 'Verified sender' badge (best-effort from extension)
+    gmailVerifiedSender: bool = False
+
     subject: str = Field(default="", max_length=240)
     linkDomains: List[str] = Field(default_factory=list)
     linkUrls: List[str] = Field(default_factory=list)
@@ -1596,13 +1573,6 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
-
-    # UI-alignment fields (optional; backward-compatible for older extensions)
-    # NOTE: these fields intentionally avoid naming internal data sources.
-    server_decision: Optional[Dict[str, Any]] = None
-    risk_score: Optional[int] = None  # 0..100 (higher = riskier)
-    signals: Optional[Dict[str, Any]] = None
-
 
 
 def upgrade_required_reply() -> str:
@@ -1767,6 +1737,9 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
     noise = classify_noise(req.subject, req.redactedSnippet)
 
+    # Tranco legitimacy signal (heuristic only) with domain_overrides
+    tranco = tranco_legitimacy_signal(sender_domain)
+
     verdict, conf, verdict_reasons = decide_verdict(
         sender_domain=sender_domain,
         mailed_by=mailed_by,
@@ -1777,10 +1750,9 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         strictness=req.strictness,
         subject=req.subject,
         redacted_snippet=req.redactedSnippet,
+        gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
+        tranco_present=bool(tranco.get('tranco_present') is True),
     )
-
-    # Tranco legitimacy signal (heuristic only) with domain_overrides
-    tranco = tranco_legitimacy_signal(sender_domain)
 
     reviewer_flags: Dict[str, Any] = {
         "sender_etld1": etld1(sender_domain) if sender_domain else "",
@@ -1958,6 +1930,8 @@ def decide_verdict(
     payment_changed: bool,
     payment_intent: bool,
     link_signals: Dict[str, Any],
+    gmail_verified: bool = False,
+    tranco_present: Optional[bool] = None,
     strictness: str = "normal",
     # NEW (backwards-compatible): pass these from build_context when available
     subject: str = "",
@@ -2054,6 +2028,15 @@ def decide_verdict(
     legitimacy = 0
     if sender_domain:
         legitimacy += 1
+
+    # Gmail verified badge and Tranco popularity are legitimacy signals (not trust overrides).
+    # They help avoid over-escalation when mailed-by/signed-by are missing or unavailable.
+    if gmail_verified:
+        legitimacy = max(legitimacy, 2)
+        reasons.append("Gmail shows this sender as verified (supporting legitimacy signal).")
+    if tranco_present is True:
+        legitimacy += 1
+        reasons.append("Sender org domain is widely used (domain reputation supporting signal).")
 
     if mailed_by and sender_domain and same_etld1(mailed_by, sender_domain):
         legitimacy += 1
@@ -2203,59 +2186,6 @@ def ai_chat(req: ChatRequest):
         if mode == "pro":
             usage_increment_best_effort(req.licenseKey, req.deviceId, amount=1)
 
-        decision = context.get("server_decision") if isinstance(context, dict) else None
-        verdict = (decision or {}).get("verdict") if isinstance(decision, dict) else ""
-        conf = (decision or {}).get("confidence") if isinstance(decision, dict) else None
-
-        # Signals for the extension UI (do not expose internal source names)
-        reviewer_flags = (context.get("reviewer_flags") or {}) if isinstance(context, dict) else {}
-        tranco = ((context.get("legitimacy_signals") or {}).get("tranco") or {}) if isinstance(context, dict) else {}
-
-        sender_popular = reviewer_flags.get("tranco_top_1m_present")
-        # Normalize to True/False/None
-        if sender_popular is not True and sender_popular is not False:
-            sender_popular = None
-
-        signals = {
-            "sender_org_domain": (context.get("sender_domain_etld1") or "") if isinstance(context, dict) else "",
-            "sender_domain_popular": sender_popular,
-            # allow the UI to explain overrides without referencing internal lists
-            "sender_domain_override": tranco.get("override_action") if isinstance(tranco, dict) else None,
-            "mailed_by_matches_sender_org": reviewer_flags.get("mailed_by_etld1_match"),
-            "signed_by_matches_sender_org": reviewer_flags.get("signed_by_etld1_match"),
-        }
-
-        # Link-domain popularity (helps reduce false positives for reputable ESP/link-tracking domains)
-        link_domains_popularity = []
-        try:
-            for ld in list(dict.fromkeys(req.linkDomains or []))[:20]:
-                t = tranco_legitimacy_signal(ld)
-                # Normalize to True/False/None
-                popular = t.get("tranco_present")
-                if popular is not True and popular is not False:
-                    popular = None
-                link_domains_popularity.append({
-                    "domain": t.get("tranco_base") or etld1(ld) or ld,
-                    "popular": popular,
-                    "reason": t.get("reason")
-                })
-        except Exception:
-            link_domains_popularity = []
-
-        signals["link_domains_popularity"] = link_domains_popularity
-
-        risk_score = None
-        try:
-            if verdict and isinstance(conf, (int, float)):
-                risk_score = risk_score_from_verdict(str(verdict), float(conf))
-        except Exception:
-            risk_score = None
-
-        return ChatResponse(
-            reply=reply,
-            server_decision=decision if isinstance(decision, dict) else None,
-            risk_score=risk_score,
-            signals=signals
-        )
+        return ChatResponse(reply=reply)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI chat failed: {str(e)}")
