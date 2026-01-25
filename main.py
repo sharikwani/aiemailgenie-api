@@ -1836,14 +1836,9 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
     # Tranco legitimacy signal (heuristic only) with domain_overrides
     tranco = tranco_legitimacy_signal(sender_domain)
 
-# Known-bad (hard denylist) must override everything (including Gmail verified + Tranco)
-kb_hit = known_bad_lookup(req.senderEmail, sender_domain)
-if kb_hit.get("hit") is True:
-    verdict = "HIGH RISK"
-    conf = 0.99
-    verdict_reasons = [kb_hit.get("reason") or "Matched known-bad list."]
-else:
-        verdict, conf, verdict_reasons = decide_verdict(
+    # Known-bad (hard denylist) lookup (hard override applied after deterministic checks)
+    kb_hit = known_bad_lookup(req.senderEmail, sender_domain)
+    verdict, conf, verdict_reasons = decide_verdict(
         sender_domain=sender_domain,
         mailed_by=mailed_by,
         signed_by=signed_by,
@@ -1855,7 +1850,14 @@ else:
         redacted_snippet=req.redactedSnippet,
         gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
         tranco_present=bool(tranco.get('tranco_present') is True),
-        )
+    )
+
+
+    # Hard override: known-bad always forces HIGH RISK
+    if isinstance(kb_hit, dict) and kb_hit.get('hit') is True:
+        verdict = 'HIGH RISK'
+        conf = 0.99
+        verdict_reasons = [kb_hit.get('reason') or 'Matched known-bad list.']
 
     reviewer_flags: Dict[str, Any] = {
         "sender_etld1": etld1(sender_domain) if sender_domain else "",
