@@ -82,95 +82,6 @@ def safe_clean_domain(d: str) -> str:
     d = re.sub(r"[^a-z0-9.\-]", "", d)
     return d[:200]
 
-def normalize_email(value: str) -> str:
-    v = (value or "").strip().lower()
-    if not v:
-        return ""
-    m = re.search(r"<([^>]+)>", v)
-    if m:
-        v = (m.group(1) or "").strip().lower()
-    v = re.sub(r"[^a-z0-9@._+\-]", "", v)
-    return v[:260]
-
-
-def _kb_cache_get() -> Optional[Dict[str, Any]]:
-    try:
-        cache = getattr(app.state, "known_bad_cache", None)
-        if not isinstance(cache, dict):
-            return None
-        exp = cache.get("exp", 0)
-        if exp and exp > int(datetime.now(timezone.utc).timestamp()):
-            return cache.get("data")
-        return None
-    except Exception:
-        return None
-
-
-def _kb_cache_set(data: Dict[str, Any]) -> None:
-    try:
-        ttl = max(30, int(KNOWN_BAD_CACHE_TTL_SECONDS))
-        app.state.known_bad_cache = {
-            "data": data,
-            "exp": int(datetime.now(timezone.utc).timestamp()) + ttl,
-            "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception:
-        return
-
-
-def load_known_bad_best_effort() -> Dict[str, Any]:
-    cached = _kb_cache_get()
-    if cached is not None:
-        return cached
-
-    empty = {"version": 0, "updated_at": "", "emails": [], "domains": []}
-
-    if not KNOWN_BAD_URL:
-        _kb_cache_set(empty)
-        return empty
-
-    try:
-        r = requests.get(KNOWN_BAD_URL, timeout=12)
-        r.raise_for_status()
-        data = r.json() if r.content else {}
-
-        emails_raw = data.get("emails") or []
-        domains_raw = data.get("domains") or []
-
-        emails = sorted({normalize_email(x) for x in emails_raw if isinstance(x, str) and x.strip()})
-        domains = sorted({safe_clean_domain(x) for x in domains_raw if isinstance(x, str) and x.strip()})
-
-        out = {
-            "version": int(data.get("version") or 1),
-            "updated_at": str(data.get("updated_at") or ""),
-            "emails": emails,
-            "domains": domains,
-        }
-        _kb_cache_set(out)
-        return out
-    except Exception:
-        _kb_cache_set(empty)
-        return empty
-
-
-def known_bad_lookup(sender_email: str, sender_domain: str) -> Dict[str, Any]:
-    kb = load_known_bad_best_effort()
-    emails = set(kb.get("emails") or [])
-    domains = set(kb.get("domains") or [])
-
-    se = normalize_email(sender_email)
-    sd = safe_clean_domain(sender_domain)
-    base = etld1(sd) if sd else ""
-
-    if se and se in emails:
-        return {"hit": True, "type": "email", "value": se, "reason": "Sender email is in known-bad list.", "meta": kb}
-
-    if sd and (sd in domains or (base and base in domains)):
-        return {"hit": True, "type": "domain", "value": sd if sd in domains else base, "reason": "Sender domain is in known-bad list.", "meta": kb}
-
-    return {"hit": False, "type": "", "value": "", "reason": "", "meta": kb}
-
-
 
 def same_etld1(a: str, b: str) -> bool:
     a = safe_clean_domain(a)
@@ -178,6 +89,171 @@ def same_etld1(a: str, b: str) -> bool:
     if not a or not b:
         return False
     return etld1(a) == etld1(b)
+
+
+
+# =============================================================================
+# KNOWN_BAD threatlist helpers
+# =============================================================================
+def _normalize_email(addr: str) -> str:
+    """
+    Normalizes an email address for comparisons.
+    Accepts formats like: 'Display Name <user@domain.com>'.
+    Returns lowercased 'user@domain.com' or '' if not parseable.
+    """
+    s = (addr or "").strip().lower()
+    if not s:
+        return ""
+    # Extract from angle brackets if present
+    m = re.search(r"<\s*([^>]+)\s*>", s)
+    if m:
+        s = m.group(1).strip()
+    s = s.replace("mailto:", "").strip()
+    # Basic sanity
+    if "@" not in s:
+        return ""
+    # Remove spaces that sometimes appear in copied strings
+    s = s.replace(" ", "")
+    # Truncate to avoid abuse
+    return s[:260]
+
+
+def _cache_get_known_bad() -> Optional[Dict[str, Any]]:
+    try:
+        cache = getattr(app.state, "known_bad_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        item = cache.get("data")
+        if not item:
+            return None
+        data, expires_at = item
+        now = int(datetime.now(timezone.utc).timestamp())
+        if isinstance(expires_at, (int, float)) and expires_at < now:
+            cache.pop("data", None)
+            return None
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def _cache_set_known_bad(data: Dict[str, Any]) -> None:
+    try:
+        cache = getattr(app.state, "known_bad_cache", None)
+        if not isinstance(cache, dict):
+            return
+        now = int(datetime.now(timezone.utc).timestamp())
+        ttl = max(10, int(KNOWN_BAD_CACHE_TTL_SECONDS))
+        cache["data"] = (data, now + ttl)
+    except Exception:
+        return
+
+
+def load_known_bad_best_effort() -> Dict[str, Any]:
+    """
+    Returns:
+      { "emails": [..], "domains": [..], "meta": {...} }
+    Best-effort: never raises.
+    """
+    cached = _cache_get_known_bad()
+    if cached is not None:
+        return cached
+
+    # If not configured, treat as empty list
+    if not KNOWN_BAD_URL:
+        data = {"emails": [], "domains": [], "meta": {"reason": "not_configured"}}
+        _cache_set_known_bad(data)
+        return data
+
+    try:
+        r = requests.get(KNOWN_BAD_URL, timeout=12, headers={"Accept": "application/json"})
+        if r.status_code >= 400 or not r.content:
+            data = {"emails": [], "domains": [], "meta": {"reason": f"fetch_failed_{r.status_code}"}}
+            _cache_set_known_bad(data)
+            return data
+
+        payload = r.json()
+        if not isinstance(payload, dict):
+            data = {"emails": [], "domains": [], "meta": {"reason": "invalid_json"}}
+            _cache_set_known_bad(data)
+            return data
+
+        emails = payload.get("emails") or []
+        domains = payload.get("domains") or []
+
+        if not isinstance(emails, list):
+            emails = []
+        if not isinstance(domains, list):
+            domains = []
+
+        norm_emails = []
+        for e in emails[:200000]:
+            ne = _normalize_email(str(e))
+            if ne:
+                norm_emails.append(ne)
+
+        norm_domains = []
+        for d in domains[:200000]:
+            nd = safe_clean_domain(str(d))
+            if nd:
+                norm_domains.append(nd)
+
+        # De-dup while preserving order
+        norm_emails = list(dict.fromkeys(norm_emails))
+        norm_domains = list(dict.fromkeys(norm_domains))
+
+        data = {
+            "emails": norm_emails,
+            "domains": norm_domains,
+            "meta": {
+                "version": payload.get("version"),
+                "updated_at": payload.get("updated_at"),
+                "source": "known_bad_url",
+                "reason": "ok",
+            },
+        }
+        _cache_set_known_bad(data)
+        return data
+
+    except Exception:
+        data = {"emails": [], "domains": [], "meta": {"reason": "exception"}}
+        _cache_set_known_bad(data)
+        return data
+
+
+def known_bad_lookup(sender_email: str, sender_domain: str) -> Dict[str, Any]:
+    """
+    Checks the known_bad threatlist for exact matches.
+
+    Returns dict:
+      {
+        "hit": bool,
+        "email_match": bool,
+        "domain_match": bool,
+        "matched": "<value>" | None,
+        "meta": {...}
+      }
+    """
+    email = _normalize_email(sender_email)
+    dom = safe_clean_domain(sender_domain)
+
+    kb = load_known_bad_best_effort()
+    emails = set(kb.get("emails") or [])
+    domains = set(kb.get("domains") or [])
+
+    email_match = bool(email and email in emails)
+    domain_match = bool(dom and dom in domains)
+
+    matched = email if email_match else (dom if domain_match else None)
+
+    return {
+        "hit": bool(email_match or domain_match),
+        "email_match": email_match,
+        "domain_match": domain_match,
+        "matched": matched,
+        "meta": kb.get("meta") or {},
+    }
 
 
 def _load_tranco_bloom_best_effort():
@@ -196,6 +272,7 @@ def _startup_load_tranco_bloom():
     app.state.tranco_bloom = _load_tranco_bloom_best_effort()
     # Best-effort cache for Worker domain_overrides
     app.state.domain_override_cache = {}
+    # Best-effort cache for known-bad threatlist (GitHub)
     app.state.known_bad_cache = {}
 
 
@@ -375,11 +452,16 @@ def apply_tranco_confidence_dampener(verdict: str, confidence: float, tranco_pre
 DB_API_URL = os.environ.get("DB_API_URL", "").strip().rstrip("/")
 DB_API_KEY = os.environ.get("DB_API_KEY", "").strip()
 
-# -----------------------------
-# Known-bad threatlist (email + domain) from GitHub RAW
-# -----------------------------
+# =============================================================================
+# Known-bad threatlist (GitHub RAW JSON)
+# - Maintained by you in a GitHub repo (public or private)
+# - The server fetches it on-demand and caches it for a short TTL.
+#
+# OVERRIDE RULE (HIGHEST PRIORITY):
+#   If senderEmail OR senderDomain matches known_bad.json => HIGH RISK (overrides Gmail Verified + Tranco).
+# =============================================================================
 KNOWN_BAD_URL = (os.environ.get("KNOWN_BAD_URL", "") or "").strip()
-KNOWN_BAD_CACHE_TTL_SECONDS = int((os.environ.get("KNOWN_BAD_CACHE_TTL_SECONDS", "30") or "300").strip())
+KNOWN_BAD_CACHE_TTL_SECONDS = int((os.environ.get("KNOWN_BAD_CACHE_TTL_SECONDS", "300") or "300").strip())
 
 
 # -----------------------------
@@ -1836,28 +1918,37 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
 
     # Tranco legitimacy signal (heuristic only) with domain_overrides
     tranco = tranco_legitimacy_signal(sender_domain)
-    # Known-bad threatlist override (FIRST PRIORITY)
+
+    # =========================================================================
+    # KNOWN_BAD threatlist check (HIGHEST PRIORITY)
+    # If the sender email/domain is present in known_bad.json, we force HIGH RISK
+    # regardless of Gmail Verified badge or Tranco presence.
+    # =========================================================================
     kb_hit = known_bad_lookup(req.senderEmail, sender_domain)
 
+    verdict, conf, verdict_reasons = decide_verdict(
+        sender_domain=sender_domain,
+        mailed_by=mailed_by,
+        signed_by=signed_by,
+        payment_changed=bool(req.paymentChanged),
+        payment_intent=bool(req.paymentIntent),
+        link_signals=link_signals,
+        strictness=req.strictness,
+        subject=req.subject,
+        redacted_snippet=req.redactedSnippet,
+        gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
+        tranco_present=bool(tranco.get('tranco_present') is True),
+    )
 
+    # =========================
+    # KNOWN_BAD HARD OVERRIDE
+    # =========================
     if kb_hit.get("hit") is True:
         verdict = "HIGH RISK"
         conf = 0.99
-        verdict_reasons = [kb_hit.get("reason") or "Matched known-bad list."]
-    else:
-            verdict, conf, verdict_reasons = decide_verdict(
-                sender_domain=sender_domain,
-                mailed_by=mailed_by,
-                signed_by=signed_by,
-                payment_changed=bool(req.paymentChanged),
-                payment_intent=bool(req.paymentIntent),
-                link_signals=link_signals,
-                strictness=req.strictness,
-                subject=req.subject,
-                redacted_snippet=req.redactedSnippet,
-                gmail_verified=bool(getattr(req, 'gmailVerifiedSender', False)),
-                tranco_present=bool(tranco.get('tranco_present') is True),
-            )
+        # Put the denylist reason first, but keep original reasons for context/debug.
+        deny_reason = "Sender is on the known-bad threatlist (denylist match)."
+        verdict_reasons = [deny_reason] + [r for r in (verdict_reasons or []) if r != deny_reason]
 
     reviewer_flags: Dict[str, Any] = {
         "sender_etld1": etld1(sender_domain) if sender_domain else "",
@@ -1865,22 +1956,24 @@ def build_context(req: "ChatRequest") -> Dict[str, Any]:
         "signed_by_etld1": etld1(signed_by) if signed_by else "",
         "mailed_by_etld1_match": bool(sender_domain and mailed_by and same_etld1(sender_domain, mailed_by)),
         "signed_by_etld1_match": bool(sender_domain and signed_by and same_etld1(sender_domain, signed_by)),
+        "known_bad_hit": bool(kb_hit.get("hit") is True),
+        "known_bad_email_match": bool(kb_hit.get("email_match") is True),
+        "known_bad_domain_match": bool(kb_hit.get("domain_match") is True),
+        "known_bad_matched": kb_hit.get("matched"),
+        "known_bad_meta": kb_hit.get("meta") or {},
         "tranco_top_1m_present": bool(tranco.get("tranco_present") is True),
         "tranco_override_action": tranco.get("override_action"),
         "tranco_present_raw": tranco.get("tranco_present_raw"),
         "confidence_dampened_by_tranco": False,
-        "known_bad_hit": bool(kb_hit.get("hit") is True),
-        "known_bad_type": kb_hit.get("type") or "",
-        "known_bad_value": kb_hit.get("value") or "",
-        "known_bad_updated_at": (kb_hit.get("meta") or {}).get("updated_at", ""),
         "note": "Tranco is a legitimacy signal only; it does not override other checks.",
     }
 
-    if kb_hit.get("hit") is True:
-        dampened = False
-    else:
+    # Only apply Tranco confidence calibration when we did NOT force a known-bad override.
+    if kb_hit.get("hit") is not True:
         conf, dampened = apply_tranco_confidence_dampener(verdict, float(conf), tranco.get("tranco_present"))
-    reviewer_flags["confidence_dampened_by_tranco"] = bool(dampened)
+        reviewer_flags["confidence_dampened_by_tranco"] = bool(dampened)
+    else:
+        reviewer_flags["confidence_dampened_by_tranco"] = False
 
     ctx = {
         "provider": (req.provider or "")[:30],
