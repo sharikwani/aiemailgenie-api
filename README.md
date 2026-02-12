@@ -29,4 +29,4 @@ To set up the API environment for development:
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/sharikwani/aiemailgenie-api.git](https://github.com/sharikwani/aiemailgenie-api.git)
+   git clone [https://github.com/sharikwani/aiemailgenie-api.git]
