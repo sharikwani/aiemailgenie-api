@@ -103,29 +103,45 @@ def _send_license_email_resend(to_email: str, license_key: str, plan_name: str) 
         return
 
 
-def _resolve_plan_from_price_id(price_id: Optional[str]) -> Tuple[str, Optional[int]]:
+def _resolve_plan_from_price_id(price_id: Optional[str]) -> Optional[Tuple[str, Optional[int]]]:
     """
-    Map Stripe price IDs to (plan_name, duration_days).
+    Returns (plan_name, duration_days) for AI Email Genie prices ONLY.
+    Returns None for any other product (e.g., Shieldra), so the webhook ignores it.
 
-    Environment variables:
-      STRIPE_PRICE_ID_PRO       -> the Stripe Price ID for Pro
-      STRIPE_PRO_DURATION_DAYS  -> optional, e.g. "365" for yearly
+    Supported env options:
+      - AIEG_PRICE_IDS="price_xxx,price_yyy,price_zzz"  (RECOMMENDED)
+      - OR STRIPE_PRICE_ID_PRO="price_xxx"              (fallback if only one AIEG price)
+
+    Optional:
+      - STRIPE_PRO_DURATION_DAYS="365"   (if you want expiry)
     """
+    if not price_id:
+        return None
+
+    # Allow-list of AI Email Genie prices (recommended)
+    allow = os.getenv("AIEG_PRICE_IDS", "").strip()
+    allow_ids = [x.strip() for x in allow.split(",") if x.strip()]
+
+    # Backward compatible single-price setup
     pro_price = os.getenv("STRIPE_PRICE_ID_PRO", "").strip()
+
+    if allow_ids:
+        if price_id not in allow_ids:
+            return None
+    else:
+        if not pro_price or price_id != pro_price:
+            return None
+
     pro_days_raw = os.getenv("STRIPE_PRO_DURATION_DAYS", "").strip()
+    if pro_days_raw:
+        try:
+            days = int(pro_days_raw)
+            if days > 0:
+                return "pro", days
+        except Exception:
+            pass
 
-    if pro_price and price_id == pro_price:
-        if pro_days_raw:
-            try:
-                days = int(pro_days_raw)
-                if days > 0:
-                    return "pro", days
-            except Exception:
-                pass
-        return "pro", None  # lifetime by default
-
-    # Fallback: if you only sell one product, still treat as Pro
-    return "pro", None
+    return "pro", None  # lifetime by default
 
 
 def _get_first_price_id(session_obj: Dict[str, Any]) -> Optional[str]:
@@ -153,7 +169,6 @@ def _try_fetch_email_from_customer(customer_id: Optional[str]) -> str:
         return ""
     try:
         cust = stripe.Customer.retrieve(customer_id)
-        # StripeObject supports dict-style access in many cases
         email = getattr(cust, "email", None) or (cust.get("email") if isinstance(cust, dict) else None) or ""
         return (email or "").strip().lower()
     except Exception:
@@ -171,7 +186,6 @@ def _try_fetch_email_from_payment_intent(payment_intent_id: Optional[str]) -> st
         latest_charge = getattr(pi, "latest_charge", None)
         if not latest_charge:
             return ""
-        # latest_charge can be StripeObject
         bd = getattr(latest_charge, "billing_details", None) or {}
         email = bd.get("email") if isinstance(bd, dict) else getattr(bd, "email", "") or ""
         return (email or "").strip().lower()
@@ -185,6 +199,7 @@ async def stripe_webhook(request: Request):
     Stripe webhook handler:
       - verify signature
       - handle checkout.session.completed
+      - ONLY fulfill AI Email Genie purchases (price allow-list)
       - create license in Worker
       - email license to customer
     """
@@ -217,10 +232,25 @@ async def stripe_webhook(request: Request):
             session_id,
             expand=["line_items.data.price"],
         )
-        # Correct conversion
         full_session_dict = full_session.to_dict_recursive()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to retrieve session: {str(e)}")
+
+    price_id = _get_first_price_id(full_session_dict)
+
+    # ✅ IMPORTANT: Only fulfill AI Email Genie prices. Ignore everything else (Shieldra, WooCommerce, etc.)
+    resolved = _resolve_plan_from_price_id(price_id)
+    if not resolved:
+        # Return 200 OK so Stripe doesn't retry; we intentionally ignore non-AIEG purchases here.
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "non_aieg_price",
+            "stripe_session_id": session_id,
+            "stripe_price_id": price_id,
+        }
+
+    plan_name, duration_days = resolved
 
     # Extract email (multi-fallback)
     customer_email = _get_customer_email_from_session(full_session_dict)
@@ -235,14 +265,12 @@ async def stripe_webhook(request: Request):
         # Better to fail so Stripe retries than silently losing fulfillment
         raise HTTPException(status_code=400, detail="Could not determine customer email from Stripe session")
 
-    price_id = _get_first_price_id(full_session_dict)
-    plan_name, duration_days = _resolve_plan_from_price_id(price_id)
-
     # Create license in Worker
     worker_payload: Dict[str, Any] = {
         "email": customer_email,
         "plan": plan_name,
-        "duration_days": duration_days,      # None => lifetime
+        "duration_days": duration_days,         # None => lifetime
+        "stripe_event_id": (event.get("id") or "").strip(),
         "stripe_session_id": session_id,
         "stripe_price_id": price_id,
     }
