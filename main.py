@@ -1379,6 +1379,18 @@ async def stripe_webhook(request: Request):
 
     plan_payload = resolve_plan_from_price_id(price_id)
 
+    # 🛡️ HARD GUARD: Only fulfill AI Email Genie purchases.
+    # Silently ignore Shieldra, HelpByExperts, VidCapsule, direct payment links, etc.
+    # Return 200 so Stripe doesn't retry the event.
+    if plan_payload is None:
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "non_aieg_price",
+            "stripe_session_id": session_id,
+            "stripe_price_id": price_id,
+        }
+
     try:
         created = db_post(
             "/admin/license/create",
@@ -1393,7 +1405,6 @@ async def stripe_webhook(request: Request):
         )
     except HTTPException as e:
         raise HTTPException(status_code=500, detail={"license_create_failed": True, "db_error": e.detail})
-
     license_key = (created.get("license_key") or "").strip()
     if license_key:
         send_license_email(
