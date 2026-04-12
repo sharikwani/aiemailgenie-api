@@ -1183,8 +1183,15 @@ def require_stripe_config():
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET not configured")
 
 
-def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
+def resolve_plan_from_price_id(price_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns a plan dict ONLY for AI Email Genie prices.
+    Returns None for any other price (Shieldra, HelpByExperts, VidCapsule,
+    direct payment links, etc.) so the webhook can ignore them safely.
+    """
     pid = (price_id or "").strip()
+    if not pid:
+        return None
 
     if STRIPE_PRICE_PRO_MONTHLY and pid == STRIPE_PRICE_PRO_MONTHLY:
         return {"plan": "pro", "duration_days": 30, "label": "AI Mail Genie Pro (Monthly)"}
@@ -1195,7 +1202,8 @@ def resolve_plan_from_price_id(price_id: str) -> Dict[str, Any]:
     if STRIPE_PRICE_PRO_LIFETIME and pid == STRIPE_PRICE_PRO_LIFETIME:
         return {"plan": "pro", "duration_days": None, "label": "AI Mail Genie Pro (Lifetime)"}
 
-    return {"plan": "pro", "duration_days": None, "label": "AI Mail Genie Pro"}
+    # 🛡️ Not an AI Email Genie price — refuse to fulfill.
+    return None
 
 
 # -----------------------------
